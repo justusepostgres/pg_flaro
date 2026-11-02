@@ -262,6 +262,7 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
     let address = std::net::SocketAddr::new(ip, PORT.get() as u16);
     // Inherit a blocked signal mask in the Rust thread. PostgreSQL's asynchronous
     // signal handlers must run on the worker's main thread, never the network thread.
+    let pending_limit = sink.pending_limit();
     let network = unsafe {
         let mut blocked: libc::sigset_t = std::mem::zeroed();
         let mut previous: libc::sigset_t = std::mem::zeroed();
@@ -310,12 +311,14 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
         }
         for batch in rx.try_iter().take(1024) {
             writes.push(batch);
-            if writes.len() >= 8192 || writes.accounted_bytes() >= 2 * 1024 * 1024 {
+            if writes.len() >= 8192
+                || writes.accounted_bytes() >= writes.flush_threshold(pending_limit)
+            {
                 break;
             }
         }
         if writes.len() >= 8192
-            || writes.accounted_bytes() >= 2 * 1024 * 1024
+            || writes.accounted_bytes() >= writes.flush_threshold(pending_limit)
             || last_flush.elapsed() >= interval
         {
             store.persist(&writes, &metrics);

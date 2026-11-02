@@ -169,3 +169,50 @@ fn ranges_ties_set_algebra_and_duplicate_counts() {
         bulk("3")
     );
 }
+
+#[test]
+fn incremental_sizes_match_codec_after_mutations() {
+    let mut e = Engine::new(64 << 20);
+    let commands = [
+        vec!["HSET", "h", "a", "short", "b", "longer"],
+        vec!["HSET", "h", "a", "", "c", "new"],
+        vec!["HDEL", "h", "b", "missing"],
+        vec!["RPUSH", "l", "a", "bb", "ccc"],
+        vec!["LSET", "l", "-1", "longer value"],
+        vec!["LSET", "l", "0", ""],
+        vec!["LTRIM", "l", "1", "-1"],
+        vec!["SADD", "s", "a", "bb", "ccc"],
+        vec!["SREM", "s", "bb", "missing"],
+        vec!["SADD", "s", "a", "dddd"],
+        vec!["ZADD", "z", "1", "a", "2", "bb"],
+        vec!["ZINCRBY", "z", "5", "a"],
+        vec!["ZADD", "z", "3", "ccc"],
+        vec!["ZREM", "z", "bb"],
+    ];
+    for command in commands {
+        assert!(!matches!(run(&mut e, &command), Reply::Error(_)));
+        let value = &e.get(command[1].as_bytes(), 1000).unwrap().value;
+        assert_eq!(value.len(), value.as_ref().len(), "{command:?}");
+        let restored = Value::from_stored(value.kind(), value.as_ref()).unwrap();
+        assert_eq!(value.memory_bytes(), restored.memory_bytes());
+    }
+    // Exercise shared internal tree nodes, rather than only tiny inline trees.
+    for i in 0..2000 {
+        let member = format!("field-{i}");
+        run(&mut e, &["HSET", "h", &member, &member]);
+        run(&mut e, &["SADD", "s", &member]);
+        run(&mut e, &["ZADD", "z", "1", &member]);
+    }
+    for i in (0..2000).step_by(7) {
+        let member = format!("field-{i}");
+        run(&mut e, &["HSET", "h", &member, "replacement"]);
+        run(&mut e, &["SREM", "s", &member]);
+        run(&mut e, &["ZREM", "z", &member]);
+        for key in [b"h", b"s", b"z"] {
+            let value = &e.get(key, 1000).unwrap().value;
+            assert_eq!(value.len(), value.as_ref().len());
+            let restored = Value::from_stored(value.kind(), value.as_ref()).unwrap();
+            assert_eq!(value.memory_bytes(), restored.memory_bytes());
+        }
+    }
+}

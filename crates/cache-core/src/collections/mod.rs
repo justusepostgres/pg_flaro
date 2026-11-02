@@ -114,7 +114,7 @@ pub(crate) fn execute(
             let entry = if data.is_empty() {
                 None
             } else {
-                match Value::from_collection(data.into_owned()) {
+                match Value::from_updated(data.into_owned(), old.as_ref().map(|e| &e.value), a) {
                     Ok(value) => Some(Entry {
                         value,
                         expires_at_ms: old.and_then(|e| e.expires_at_ms),

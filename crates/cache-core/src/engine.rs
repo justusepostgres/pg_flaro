@@ -18,6 +18,18 @@ pub struct Mutation {
     pub entry: Option<Entry>,
 }
 impl Mutation {
+    /// Stable PGC1 accounting, independent of the in-memory collection representation.
+    pub fn journal_bytes(&self) -> usize {
+        self.bytes()
+            - self.entry.as_ref().map_or(0, |e| {
+                if e.value.kind() == 0 {
+                    0
+                } else {
+                    crate::value::COLLECTION_BASE_MEMORY
+                }
+            })
+    }
+
     pub fn bytes(&self) -> usize {
         self.key.len() + self.entry.as_ref().map_or(0, |e| e.value.memory_bytes()) + 128
     }

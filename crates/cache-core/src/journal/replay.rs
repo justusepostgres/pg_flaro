@@ -40,7 +40,10 @@ impl Replay {
         if mutations.is_empty() {
             return Err("empty journal row");
         }
-        let accounted = mutations.iter().map(|m| m.bytes() as u64).sum::<u64>();
+        let accounted = mutations
+            .iter()
+            .map(|m| m.journal_bytes() as u64)
+            .sum::<u64>();
         let bytes = self.bytes[slot]
             .checked_add(accounted)
             .ok_or("journal accounting overflow")?;
@@ -68,6 +71,30 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn typed_journal_accounting_survives_memory_representation_upgrade() {
+        // A pre-optimization single-field hash: 20 encoded bytes + 4 payload
+        // bytes + 160 per item + 1 key byte + 128 mutation overhead = 313.
+        let value =
+            crate::value::Value::from_stored(1, b"COL1\x01\0\0\0\x01\0\0\0f\x03\0\0\0old").unwrap();
+        let mutation = Mutation {
+            key: b"k".as_slice().into(),
+            entry: Some(Entry {
+                value,
+                expires_at_ms: None,
+            }),
+        };
+        assert_eq!(mutation.journal_bytes(), 313);
+        assert!(mutation.bytes() > mutation.journal_bytes());
+        let state = State::default().append(1, 313, 1 << 20).unwrap();
+        let mut replay = Replay::new(state, 1 << 20).unwrap();
+        let restored = replay
+            .push(0, 0, 1, &encode(&[mutation.clone()]).unwrap())
+            .unwrap();
+        assert_eq!(restored[0].entry, mutation.entry);
+        replay.finish().unwrap();
+    }
+
+    #[test]
     fn recovery_before_and_after_compaction_has_identical_final_values() {
         let first = Mutation {
             key: b"key".as_slice().into(),
@@ -82,12 +109,14 @@ mod tests {
         };
         let limit = 1024;
         let sealed = State::default()
-            .append(3, first.bytes() as u64, limit)
+            .append(3, first.journal_bytes() as u64, limit)
             .unwrap()
             .rotate(limit)
             .unwrap();
         let ticket = sealed.sealed().unwrap();
-        let during = sealed.append(8, second.bytes() as u64, limit).unwrap();
+        let during = sealed
+            .append(8, second.journal_bytes() as u64, limit)
+            .unwrap();
         let after = during.finish(ticket, limit).unwrap();
         for state in [during, after] {
             let mut snapshot = HashMap::new();
@@ -119,7 +148,7 @@ mod tests {
             key: b"key".as_slice().into(),
             entry: None,
         };
-        let bytes = mutation.bytes() as u64;
+        let bytes = mutation.journal_bytes() as u64;
         let payload = encode(&[mutation]).unwrap();
         let state = State::default().append(7, bytes, 1024).unwrap();
         assert!(Replay::new(state, 1024).unwrap().finish().is_err());

@@ -1,10 +1,12 @@
 //! Typed immutable values with a versioned binary representation for persistence.
 use crate::engine::Bytes;
+use im::{HashMap, HashSet, OrdSet, Vector};
+// Reserve room for sparsely populated persistent-tree roots and vector chunks.
+pub(crate) const COLLECTION_BASE_MEMORY: usize = 8192;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Score(pub f64);
@@ -21,8 +23,8 @@ impl Ord for Score {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SortedSet {
-    pub scores: BTreeMap<Bytes, Score>,
-    pub order: BTreeSet<(Score, Bytes)>,
+    pub scores: HashMap<Bytes, Score>,
+    pub order: OrdSet<(Score, Bytes)>,
 }
 impl SortedSet {
     pub fn insert(&mut self, member: Bytes, score: f64) {
@@ -33,7 +35,7 @@ impl SortedSet {
         self.order.insert((score, member));
     }
     pub fn remove(&mut self, member: &[u8]) -> bool {
-        if let Some((member, score)) = self.scores.remove_entry(member) {
+        if let Some((member, score)) = self.scores.remove_with_key(member) {
             self.order.remove(&(score, member));
             true
         } else {
@@ -43,17 +45,17 @@ impl SortedSet {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Collection {
-    Hash(BTreeMap<Bytes, Bytes>),
-    List(VecDeque<Bytes>),
-    Set(BTreeSet<Bytes>),
+    Hash(HashMap<Bytes, Bytes>),
+    List(Vector<Bytes>),
+    Set(HashSet<Bytes>),
     ZSet(SortedSet),
 }
 impl Collection {
     pub fn empty(kind: u8) -> Self {
         match kind {
-            1 => Self::Hash(BTreeMap::new()),
-            2 => Self::List(VecDeque::new()),
-            3 => Self::Set(BTreeSet::new()),
+            1 => Self::Hash(HashMap::new()),
+            2 => Self::List(Vector::new()),
+            3 => Self::Set(HashSet::new()),
             4 => Self::ZSet(SortedSet::default()),
             _ => unreachable!(),
         }
@@ -78,12 +80,13 @@ impl Collection {
         self.len() == 0
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     String(Bytes),
     Collection {
         data: Arc<Collection>,
-        encoded: Bytes,
+        encoded: Arc<OnceLock<Bytes>>,
+        encoded_len: usize,
         memory: usize,
     },
 }
@@ -107,7 +110,7 @@ impl Deref for Value {
     fn deref(&self) -> &[u8] {
         match self {
             Self::String(v) => v,
-            Self::Collection { encoded, .. } => encoded,
+            Self::Collection { data, encoded, .. } => encoded.get_or_init(|| encode(data)),
         }
     }
 }
@@ -139,50 +142,126 @@ impl Value {
         }
     }
     pub fn from_collection(data: Collection) -> Result<Self, &'static str> {
+        let bytes = match &data {
+            Collection::Hash(v) => v.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>(),
+            Collection::List(v) => v.iter().map(|v| v.len()).sum(),
+            Collection::Set(v) => v.iter().map(|v| v.len()).sum(),
+            Collection::ZSet(v) => v.scores.keys().map(|v| v.len() + 8).sum(),
+        };
+        Self::with_payload_size(data, bytes)
+    }
+    /// Reuse snapshot size metadata by inspecting only fields touched by a command.
+    pub(crate) fn from_updated(
+        data: Collection,
+        old: Option<&Value>,
+        args: &[&[u8]],
+    ) -> Result<Self, &'static str> {
+        let Some(old) = old else {
+            return Self::from_collection(data);
+        };
+        let Some(previous) = old.collection() else {
+            return Self::from_collection(data);
+        };
+        let fields = if matches!(previous, Collection::Hash(_) | Collection::ZSet(_)) {
+            2
+        } else {
+            1
+        };
+        let mut bytes = (old.len() - 8 - previous.len() * fields * 4) as isize;
+        match (previous, &data) {
+            (Collection::Hash(a), Collection::Hash(b)) => {
+                let step = if args[0].eq_ignore_ascii_case(b"HSET")
+                    || args[0].eq_ignore_ascii_case(b"HMSET")
+                {
+                    2
+                } else if args[0].eq_ignore_ascii_case(b"HDEL") {
+                    1
+                } else {
+                    args.len()
+                };
+                let mut seen = std::collections::HashSet::new();
+                for key in args[2..].iter().step_by(step) {
+                    if !seen.insert(*key) {
+                        continue;
+                    }
+                    bytes -= a.get(*key).map_or(0, |v| key.len() + v.len()) as isize;
+                    bytes += b.get(*key).map_or(0, |v| key.len() + v.len()) as isize;
+                }
+            }
+            (Collection::Set(a), Collection::Set(b)) => {
+                let mut seen = std::collections::HashSet::new();
+                for key in &args[2..] {
+                    if !seen.insert(*key) {
+                        continue;
+                    }
+                    bytes -= if a.contains(*key) {
+                        key.len() as isize
+                    } else {
+                        0
+                    };
+                    bytes += if b.contains(*key) {
+                        key.len() as isize
+                    } else {
+                        0
+                    };
+                }
+            }
+            (Collection::ZSet(a), Collection::ZSet(_))
+                if args[0].eq_ignore_ascii_case(b"ZINCRBY") =>
+            {
+                if !a.scores.contains_key(args[3]) {
+                    bytes += (args[3].len() + 8) as isize;
+                }
+            }
+            (Collection::List(a), Collection::List(b)) if args[0].eq_ignore_ascii_case(b"LSET") => {
+                let index = std::str::from_utf8(args[2])
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap();
+                let index = if index < 0 {
+                    a.len() as i64 + index
+                } else {
+                    index
+                } as usize;
+                bytes += b[index].len() as isize - a[index].len() as isize;
+            }
+            _ => return Self::from_collection(data),
+        }
+        Self::with_payload_size(
+            data,
+            usize::try_from(bytes).expect("collection size underflow"),
+        )
+    }
+    fn with_payload_size(data: Collection, bytes: usize) -> Result<Self, &'static str> {
         if data.is_empty() {
             return Err("empty collections must delete their key");
         }
-        let mut encoded = b"COL1".to_vec();
-        encoded.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        let mut bytes = 0;
-        let mut field = |value: &[u8]| {
-            bytes += value.len();
-            encoded.extend_from_slice(&(value.len() as u32).to_le_bytes());
-            encoded.extend_from_slice(value);
+        let fields = if matches!(data, Collection::Hash(_) | Collection::ZSet(_)) {
+            2
+        } else {
+            1
         };
-        match &data {
-            Collection::Hash(v) => {
-                for (k, v) in v {
-                    field(k);
-                    field(v);
-                }
-            }
-            Collection::List(v) => {
-                for v in v {
-                    field(v);
-                }
-            }
-            Collection::Set(v) => {
-                for v in v {
-                    field(v);
-                }
-            }
-            Collection::ZSet(v) => {
-                for (member, score) in &v.scores {
-                    field(member);
-                    field(&score.0.to_le_bytes());
-                }
-            }
-        }
-        if encoded.len() > crate::protocol::MAX_FRAME {
+        let encoded_len = 8 + bytes + data.len() * fields * 4;
+        if encoded_len > crate::protocol::MAX_FRAME {
             return Err("collection exceeds maximum encoded size");
         }
-        let memory = encoded.len() + bytes + data.len() * 160;
+        let memory = encoded_len + bytes + data.len() * 160 + COLLECTION_BASE_MEMORY;
         Ok(Self::Collection {
             memory,
+            encoded_len,
             data: Arc::new(data),
-            encoded: encoded.into(),
+            encoded: Arc::new(OnceLock::new()),
         })
+    }
+    /// Encoded size without materializing a persistence snapshot on the network thread.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::String(v) => v.len(),
+            Self::Collection { encoded_len, .. } => *encoded_len,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
     pub fn from_stored(kind: u8, bytes: &[u8]) -> Result<Self, &'static str> {
         if kind == 0 {
@@ -231,7 +310,7 @@ impl Value {
                 }
                 Collection::List(v) => v.push_back(field()?),
                 Collection::Set(v) => {
-                    if !v.insert(field()?) {
+                    if v.insert(field()?).is_some() {
                         return Err("duplicate set member");
                     }
                 }
@@ -256,3 +335,48 @@ impl Value {
         Self::from_collection(data)
     }
 }
+
+fn encode(data: &Collection) -> Bytes {
+    let mut encoded = b"COL1".to_vec();
+    encoded.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let mut field = |v: &[u8]| {
+        encoded.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(v);
+    };
+    match data {
+        Collection::Hash(v) => {
+            for (k, v) in v {
+                field(k);
+                field(v);
+            }
+        }
+        Collection::List(v) => {
+            for v in v {
+                field(v);
+            }
+        }
+        Collection::Set(v) => {
+            for v in v {
+                field(v);
+            }
+        }
+        Collection::ZSet(v) => {
+            for (m, s) in &v.scores {
+                field(m);
+                field(&s.0.to_le_bytes());
+            }
+        }
+    }
+    encoded.into()
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::Collection { data: a, .. }, Self::Collection { data: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for Value {}

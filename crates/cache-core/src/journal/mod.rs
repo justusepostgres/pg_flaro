@@ -19,7 +19,7 @@ pub fn encode(mutations: &[Mutation]) -> Result<Vec<u8>, &'static str> {
             return Err("journal field too large");
         }
         accounted = accounted
-            .checked_add(m.bytes())
+            .checked_add(m.journal_bytes())
             .ok_or("journal accounting overflow")?;
         if accounted > MAX_ACCOUNTED_BYTES {
             return Err("journal batch too large");
@@ -99,7 +99,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Mutation>, &'static str> {
             },
         };
         accounted = accounted
-            .checked_add(mutation.bytes())
+            .checked_add(mutation.journal_bytes())
             .ok_or("journal accounting overflow")?;
         if accounted > MAX_ACCOUNTED_BYTES {
             return Err("journal batch too large");
@@ -118,7 +118,7 @@ pub fn batch_ranges(mutations: &[Mutation]) -> Result<Vec<std::ops::Range<usize>
     let mut ranges = Vec::new();
     let (mut start, mut bytes) = (0, 0);
     for (index, mutation) in mutations.iter().enumerate() {
-        let cost = mutation.bytes();
+        let cost = mutation.journal_bytes();
         if cost > MAX_ACCOUNTED_BYTES {
             return Err("journal mutation too large");
         }

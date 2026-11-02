@@ -83,7 +83,7 @@ impl AppendBatch {
         assert!(!mutations.is_empty());
         Self {
             payload: pg_cache_core::journal::encode(mutations).expect("encode journal batch"),
-            bytes: mutations.iter().map(Mutation::bytes).sum::<usize>() as u64,
+            bytes: mutations.iter().map(Mutation::journal_bytes).sum::<usize>() as u64,
         }
     }
 }
@@ -98,7 +98,7 @@ pub(crate) struct AppendTiming {
 pub(crate) fn journal_proto_append(sequence: i64, payload: Vec<u8>) -> bool {
     let mutations = decode(&payload).expect("valid journal batch");
     assert!(!mutations.is_empty());
-    let bytes = mutations.iter().map(Mutation::bytes).sum::<usize>() as u64;
+    let bytes = mutations.iter().map(Mutation::journal_bytes).sum::<usize>() as u64;
     append(
         sequence,
         &[AppendBatch { payload, bytes }],
@@ -114,7 +114,7 @@ fn journal_proto_append_records(sequence: i64, first: Vec<u8>, second: Vec<u8>) 
         .map(|payload| {
             let mutations = decode(&payload).expect("valid journal record");
             assert!(!mutations.is_empty());
-            let bytes = mutations.iter().map(Mutation::bytes).sum::<usize>() as u64;
+            let bytes = mutations.iter().map(Mutation::journal_bytes).sum::<usize>() as u64;
             AppendBatch { payload, bytes }
         })
         .collect();

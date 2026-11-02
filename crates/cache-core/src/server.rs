@@ -37,6 +37,7 @@ pub struct Sink {
     accepted: u64,
     staged: Vec<Mutation>,
     staged_bytes: usize,
+    staged_collections: HashMap<crate::engine::Bytes, usize>,
     staged_since: Option<Instant>,
 }
 pub fn channel(sequence: u64) -> (Sink, Receiver) {
@@ -64,14 +65,30 @@ pub fn channel_with_limit(
             accepted: sequence,
             staged: Vec::new(),
             staged_bytes: 0,
+            staged_collections: HashMap::new(),
             staged_since: None,
         },
         rx,
     )
 }
 impl Sink {
+    pub fn pending_limit(&self) -> usize {
+        self.pending_limit
+    }
+
     pub(crate) fn submit(&mut self, mutations: Mutations) -> bool {
-        let bytes = mutations.iter().map(Mutation::bytes).sum();
+        let bytes: usize = mutations.iter().map(Mutation::bytes).sum();
+        // Only single-key collection snapshots use local replacement. Multi-key
+        // commands invalidate the index so their ordering remains unambiguous.
+        let typed = mutations.len() == 1
+            && mutations[0]
+                .entry
+                .as_ref()
+                .is_some_and(|e| e.value.kind() != 0);
+        let replacement = typed
+            .then(|| self.staged_collections.get(&mutations[0].key).copied())
+            .flatten();
+        let reclaimed = replacement.map_or(0, |i| self.staged[i].bytes());
         let Some(sequence) = self
             .accepted
             .checked_add(1)
@@ -82,7 +99,9 @@ impl Sink {
         if self
             .pending
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(bytes).filter(|n| *n <= self.pending_limit)
+                n.checked_sub(reclaimed)
+                    .and_then(|n| n.checked_add(bytes))
+                    .filter(|n| *n <= self.pending_limit)
             })
             .is_err()
         {
@@ -91,8 +110,20 @@ impl Sink {
         if self.staged.is_empty() {
             self.staged_since = Some(Instant::now());
         }
-        self.staged.extend(mutations);
-        self.staged_bytes += bytes;
+        if let Some(index) = replacement {
+            self.staged[index] = mutations.into_iter().next().unwrap();
+        } else {
+            for mutation in mutations {
+                if typed {
+                    self.staged_collections
+                        .insert(mutation.key.clone(), self.staged.len());
+                } else {
+                    self.staged_collections.remove(&mutation.key);
+                }
+                self.staged.push(mutation);
+            }
+        }
+        self.staged_bytes = self.staged_bytes - reclaimed + bytes;
         self.accepted = sequence;
         true
     }
@@ -113,6 +144,7 @@ impl Sink {
         if self.staged.is_empty() {
             return Ok(());
         }
+        self.staged_collections.clear();
         let batch = Batch {
             sequence: self.accepted,
             mutations: std::mem::take(&mut self.staged),
@@ -131,7 +163,12 @@ impl Sink {
             })
     }
     fn flush_if_due(&mut self) -> io::Result<()> {
-        if self.staged_bytes >= HANDOFF_BYTES || self.handoff_wait().is_zero() {
+        let threshold = if self.staged_collections.is_empty() {
+            HANDOFF_BYTES
+        } else {
+            self.pending_limit / 4
+        };
+        if self.staged_bytes >= threshold || self.handoff_wait().is_zero() {
             self.flush()?;
         }
         Ok(())
@@ -546,6 +583,54 @@ pub fn serve_cluster(
 mod tests {
     use super::*;
     use crate::engine::Entry;
+
+    #[test]
+    fn collection_staging_replaces_only_superseded_snapshots() {
+        let make = |value: &[u8]| Mutation {
+            key: b"k".as_slice().into(),
+            entry: Some(Entry {
+                value: crate::value::Value::from_collection(crate::value::Collection::Hash(
+                    [(
+                        crate::engine::Bytes::from(b"f".as_slice()),
+                        crate::engine::Bytes::from(value),
+                    )]
+                    .into_iter()
+                    .collect(),
+                ))
+                .unwrap(),
+                expires_at_ms: None,
+            }),
+        };
+        let first = make(b"first");
+        let last = make(b"last");
+        let (mut sink, rx) = channel_with_limit(0, false, first.bytes());
+        assert!(sink.submit(smallvec::smallvec![first.clone()]));
+        assert!(sink.submit(smallvec::smallvec![last.clone()]));
+        assert_eq!(sink.pending.load(Ordering::Relaxed), last.bytes());
+        sink.flush().unwrap();
+        let batch = rx.recv().unwrap();
+        assert_eq!(batch.sequence, 2);
+        assert_eq!(batch.mutations.len(), 1);
+        assert_eq!(batch.mutations[0].entry, last.entry);
+        assert!(!sink.submit(smallvec::smallvec![first.clone()]));
+        drop(batch);
+        assert!(sink.submit(smallvec::smallvec![first]));
+        sink.flush().unwrap();
+        drop(rx.recv().unwrap());
+        assert_eq!(sink.pending.load(Ordering::Relaxed), 0);
+
+        let (mut sink, rx) = channel(0);
+        assert!(sink.submit(smallvec::smallvec![make(b"old")]));
+        assert!(sink.submit(smallvec::smallvec![Mutation {
+            key: b"k".as_slice().into(),
+            entry: None
+        }]));
+        assert!(sink.submit(smallvec::smallvec![make(b"new")]));
+        sink.flush().unwrap();
+        let batch = rx.recv().unwrap();
+        assert_eq!(batch.mutations.len(), 3);
+        assert_eq!(batch.mutations[2].entry, make(b"new").entry);
+    }
 
     #[test]
     fn local_staging_remains_bounded_when_a_consumer_releases_a_batch() {

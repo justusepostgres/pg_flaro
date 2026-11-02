@@ -26,9 +26,9 @@ pub(super) fn run(cmd: &str, a: &[&[u8]], data: &mut Cow<'_, Collection>) -> Res
     let mut n = 0;
     for member in &a[2..] {
         n += i64::from(if cmd == "sadd" {
-            set.insert((*member).into())
+            set.insert((*member).into()).is_none()
         } else {
-            set.remove(*member)
+            set.remove(*member).is_some()
         });
     }
     Ok((Reply::Integer(n), n > 0))
@@ -60,9 +60,12 @@ pub(super) fn algebra(
                 result.extend(s.iter().cloned());
             }
         } else if cmd.starts_with("sinter") {
-            result.retain(|k| set.is_some_and(|s| s.contains(k)));
+            result = result
+                .into_iter()
+                .filter(|k| set.is_some_and(|s| s.contains(k)))
+                .collect();
         } else if let Some(s) = set {
-            result.retain(|k| !s.contains(k));
+            result = result.into_iter().filter(|k| !s.contains(k)).collect();
         }
         // Bound union work before constructing the canonical snapshot.
         if result.iter().map(|k| k.len() + 160).sum::<usize>()

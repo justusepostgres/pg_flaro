@@ -103,7 +103,7 @@ pub(super) fn run(cmd: &str, a: &[&[u8]], data: &mut Cow<'_, Collection>) -> Res
             let r = range(integer(a[2])?, integer(a[3])?, list.len());
             let changed = r.len() != list.len();
             list.truncate(r.end);
-            list.drain(..r.start);
+            *list = list.skip(r.start);
             Ok((Reply::Simple("OK"), changed))
         }
         "lrem" => {
@@ -115,7 +115,7 @@ pub(super) fn run(cmd: &str, a: &[&[u8]], data: &mut Cow<'_, Collection>) -> Res
             };
             let mut removed = 0;
             if count < 0 {
-                list.make_contiguous().reverse();
+                *list = list.iter().rev().cloned().collect();
             }
             list.retain(|v| {
                 if removed < max && v.as_ref() == a[3] {
@@ -126,7 +126,7 @@ pub(super) fn run(cmd: &str, a: &[&[u8]], data: &mut Cow<'_, Collection>) -> Res
                 }
             });
             if count < 0 {
-                list.make_contiguous().reverse();
+                *list = list.iter().rev().cloned().collect();
             }
             Ok((Reply::Integer(removed as i64), removed > 0))
         }

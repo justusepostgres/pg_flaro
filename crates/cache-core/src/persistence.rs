@@ -30,6 +30,7 @@ pub struct PendingWrites {
     latest: HashMap<Bytes, Mutation>,
     pending: Option<Arc<AtomicUsize>>,
     bytes: usize,
+    collections: usize,
     sequence: Option<u64>,
 }
 impl PendingWrites {
@@ -50,7 +51,11 @@ impl PendingWrites {
         // Transfer ownership of reservations before the incoming batch is dropped.
         self.bytes += std::mem::take(&mut batch.bytes);
         for mutation in batch.mutations.drain(..) {
+            self.collections +=
+                usize::from(mutation.entry.as_ref().is_some_and(|e| e.value.kind() != 0));
             if let Some(old) = self.latest.insert(mutation.key.clone(), mutation) {
+                self.collections -=
+                    usize::from(old.entry.as_ref().is_some_and(|e| e.value.kind() != 0));
                 let released = old.bytes();
                 drop(old);
                 self.bytes -= released;
@@ -81,7 +86,15 @@ impl PendingWrites {
     pub fn accounted_bytes(&self) -> usize {
         self.bytes
     }
+    pub fn flush_threshold(&self, pending_limit: usize) -> usize {
+        if self.collections == 0 {
+            2 * 1024 * 1024
+        } else {
+            pending_limit / 4
+        }
+    }
     pub fn clear(&mut self) {
+        self.collections = 0;
         self.latest.clear();
         if let Some(pending) = &self.pending {
             pending.fetch_sub(std::mem::take(&mut self.bytes), Ordering::Relaxed);
