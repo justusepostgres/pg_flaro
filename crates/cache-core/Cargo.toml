@@ -1,0 +1,14 @@
+[package]
+name = "pg-cache-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+io-diagnostics = []
+
+[dependencies]
+polling = "=3.11.0"
+
+
+smallvec = "=1.16.4"
+itoa = "=1.0.18"

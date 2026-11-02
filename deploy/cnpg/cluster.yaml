@@ -1,0 +1,75 @@
+# Replace imageName with your private image/tag or digest before applying.
+# This example needs CNPG 1.28 and a default storage class.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-cache
+spec:
+  instances: 2
+  imageName: REGISTRY/pg-cache:17.11-0.1.0
+  bootstrap:
+    initdb:
+      database: cache
+      owner: cache_owner
+      postInitApplicationSQL:
+        - CREATE EXTENSION pg_cache
+        - CREATE EXTENSION pg_cache_journal
+  postgresql:
+    shared_preload_libraries: [pg_cache]
+    parameters:
+      pg_cache.database: cache
+      pg_cache.listen_address: 0.0.0.0
+      pg_cache.port: '6380'
+      pg_cache.journal: 'on'
+      pg_cache.journal_pending_mb: '128'
+      pg_cache.memory_mb: '512'
+      pg_cache.flush_ms: '25'
+  resources:
+    requests:
+      cpu: '1'
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  storage:
+    size: 10Gi
+  managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: pg-cache-redis
+            spec:
+              type: ClusterIP
+              ports:
+                - name: redis
+                  protocol: TCP
+                  port: 6380
+                  targetPort: 6380
+---
+# Redis has no authentication/TLS in this prototype. Require private access.
+# Keep PostgreSQL replication/management accessible; restrict only the RESP port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pg-cache-private-redis
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: pg-cache
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 9187
+    - from:
+        - podSelector:
+            matchLabels:
+              pg-cache-client: 'true'
+      ports:
+        - protocol: TCP
+          port: 6380

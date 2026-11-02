@@ -1,0 +1,5 @@
+comment = 'WAL-logged journal tables for pg_cache write-behind persistence'
+default_version = '0.1.0'
+requires = 'pg_cache'
+relocatable = false
+superuser = true

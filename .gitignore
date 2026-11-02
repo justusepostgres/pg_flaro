@@ -1,0 +1,21 @@
+/target/
+/.local/
+__pycache__/
+
+
+# Local experiments, infrastructure records, and benchmark output.
+/benchmarks/
+/crates/cache-core/examples/reap_bench.rs
+*.orig
+*.rej
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Publish correctness tests; keep benchmark orchestration local.
+/scripts/*
+!/scripts/integration.py
+!/scripts/installed_integration.py
+!/scripts/redis_client_integration.py

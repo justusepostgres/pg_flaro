@@ -1,0 +1,5 @@
+comment = 'Redis-compatible write-behind memory cache (experimental)'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_cache'
+relocatable = false
+superuser = true

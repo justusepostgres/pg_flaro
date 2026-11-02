@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/cache-core", "crates/pg-cache"]
+default-members = ["crates/cache-core"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
