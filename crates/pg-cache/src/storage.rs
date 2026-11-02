@@ -1,5 +1,5 @@
 //! Tuple locations are disposable hints, never identities. Native updates validate
-//! the visible row's key; stale hints fall back to a SQL primary-index upsert.
+//! the visible row's key; stale hints fall back to a serialized SQL MERGE.
 use pg_cache_core::{engine::Bytes, metrics::PersistenceMetrics, server::PendingWrites};
 use pgrx::{bgworkers::BackgroundWorker, prelude::*};
 use std::collections::HashMap;
@@ -66,6 +66,10 @@ impl Store {
             let mut learned = Vec::new();
             let sql_started = std::time::Instant::now();
             Spi::run("SET LOCAL synchronous_commit = on").expect("synchronous commit");
+            // Hash indexes do not enforce uniqueness. Serialize the read/modify/
+            // insert decision; the in-memory batch already has distinct keys.
+            Spi::run("LOCK TABLE cache_store.entries IN SHARE ROW EXCLUSIVE MODE")
+                .expect("serialize cache writes");
             let mut updated = vec![false; keys.len()];
             if locations.iter().any(Option::is_some) {
                 for (index, tid) in
@@ -86,17 +90,21 @@ impl Store {
                 }
             }
             if !missing_keys.is_empty() {
-                Spi::connect_mut(|client| {
-                    let rows = client.update(
-                        "INSERT INTO cache_store.entries (key,value,expires_at_ms) SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[]) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, expires_at_ms=EXCLUDED.expires_at_ms RETURNING key,ctid",
+                super::point_lookup::run(|| {
+                    Spi::connect_mut(|client| {
+                        // A SELECT around MERGE RETURNING avoids SPI status19,
+                        // which pgrx0.16.1 does not yet recognize.
+                        let rows = client.update(
+                        "WITH changed AS (MERGE INTO cache_store.entries AS target USING (SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[])) AS source(key,value,expires_at_ms) ON target.key=source.key WHEN MATCHED THEN UPDATE SET value=source.value,expires_at_ms=source.expires_at_ms WHEN NOT MATCHED THEN INSERT(key,value,expires_at_ms) VALUES(source.key,source.value,source.expires_at_ms) RETURNING target.key,target.ctid) SELECT key,ctid FROM changed",
                         None, &[missing_keys.into(), missing_values.into(), missing_expirations.into()],
                     ).expect("persist missing tuple hints");
-                    for row in rows {
-                        learned.push((
-                            row.get::<Vec<u8>>(1).unwrap().unwrap().into(),
-                            row.get::<pg_sys::ItemPointerData>(2).unwrap().unwrap(),
-                        ));
-                    }
+                        for row in rows {
+                            learned.push((
+                                row.get::<Vec<u8>>(1).unwrap().unwrap().into(),
+                                row.get::<pg_sys::ItemPointerData>(2).unwrap().unwrap(),
+                            ));
+                        }
+                    })
                 });
             }
             if !deletes.is_empty() {

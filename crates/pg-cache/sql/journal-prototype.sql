@@ -26,5 +26,6 @@ CREATE TABLE cache_journal.segment0 (
 CREATE TABLE cache_journal.segment1 (LIKE cache_journal.segment0 INCLUDING ALL);
 ALTER TABLE cache_journal.segment0 ALTER COLUMN payload SET STORAGE PLAIN;
 ALTER TABLE cache_journal.segment1 ALTER COLUMN payload SET STORAGE PLAIN;
-CREATE TABLE cache_journal.entries(key bytea PRIMARY KEY, value bytea NOT NULL, expires_at_ms bigint);
+CREATE TABLE cache_journal.entries(key bytea NOT NULL, value bytea NOT NULL, expires_at_ms bigint);
+CREATE INDEX entries_key_hash_idx ON cache_journal.entries USING hash (key);
 REVOKE ALL ON ALL TABLES IN SCHEMA cache_journal FROM PUBLIC;

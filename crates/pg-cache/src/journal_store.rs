@@ -232,11 +232,16 @@ fn read_changes(state: State, limit: u64) -> Changes {
 }
 
 fn apply(changes: &Changes) {
+    // Visit rows in key order instead of hash-table order for heap locality. The
+    // segment already bounds changes; this adds only a vector of borrowed pairs,
+    // without duplicating key/value payloads or changing the transaction boundary.
+    let mut ordered: Vec<_> = changes.iter().collect();
+    ordered.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     // Bound executor tuplestores and parameter allocations. All statements stay
     // in the caller's single compaction transaction; no watermark moves early.
     let mut batch = Vec::new();
     let mut bytes = 0;
-    for (key, entry) in changes {
+    for (key, entry) in ordered {
         let cost = key.len() + entry.as_ref().map_or(0, |entry| entry.value.len()) + 128;
         if !batch.is_empty() && (batch.len() >= 512 || bytes + cost > 1024 * 1024) {
             apply_batch(&batch);
@@ -267,7 +272,7 @@ fn apply_batch(batch: &[(&Bytes, &Option<Entry>)]) {
             }
         }
         if !keys.is_empty() {
-            client.update("INSERT INTO cache_journal.entries(key,value,expires_at_ms) SELECT * FROM unnest($1::bytea[],$2::bytea[],$3::bigint[]) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,expires_at_ms=EXCLUDED.expires_at_ms", None, &[keys.into(),values.into(),expirations.into()]).expect("materialize journal values");
+            client.update("MERGE INTO cache_journal.entries AS target USING (SELECT * FROM unnest($1::bytea[],$2::bytea[],$3::bigint[])) AS source(key,value,expires_at_ms) ON target.key=source.key WHEN MATCHED THEN UPDATE SET value=source.value,expires_at_ms=source.expires_at_ms WHEN NOT MATCHED THEN INSERT(key,value,expires_at_ms) VALUES(source.key,source.value,source.expires_at_ms)", None, &[keys.into(),values.into(),expirations.into()]).expect("materialize journal values");
         }
         if !deletes.is_empty() {
             client
@@ -307,7 +312,10 @@ pub(crate) fn journal_proto_compact() -> bool {
     };
     prefix.segments[ticket.slot] = ticket.segment;
     let changes = read_changes(prefix, limit);
-    apply(&changes);
+    // Hash indexes recheck full keys but do not enforce uniqueness. Our advisory
+    // lock serializes the entire MERGE read/modify/insert decision across all
+    // compactors. Direct SQL writes to these private tables are unsupported.
+    super::point_lookup::run(|| apply(&changes));
     // Appends may have committed during apply(). Reload and preserve their state.
     // The writer's metadata lock is held only during this short finalization.
     let (current, current_limit) = state("FOR UPDATE");

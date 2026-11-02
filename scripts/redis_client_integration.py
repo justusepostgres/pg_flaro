@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Real redis-py 6.4.0 RESP2 integration; targets only explicitly supplied endpoints.
 
-Use execute_command for INCR: redis-py incr() emits unsupported INCRBY.
 Pipelines must use transaction=False: MULTI/EXEC are outside the command subset.
 Only keys under --prefix are written. Run write then verify across a restart or
 promotion. The barrier confirms local PostgreSQL commit, not replica replay.
@@ -49,11 +48,11 @@ def exercise(client, prefix):
     assert client.set(prefix + b'conditional', b'ignored', nx=True) is None
     assert client.set(prefix + b'conditional', b'replaced', xx=True)
     assert client.set(prefix + b'counter', 40)
-    assert client.execute_command('INCR', prefix + b'counter') == 41
-    assert client.execute_command('INCR', prefix + b'counter') == 42
-    assert client.set(prefix + b'expired', b'goes', px=150)
+    assert client.incr(prefix + b'counter') == 41
+    assert client.incrby(prefix + b'counter', 1) == 42
+    assert client.psetex(prefix + b'expired', 150, b'goes')
     assert 0 < client.pttl(prefix + b'expired') <= 150
-    assert client.set(prefix + b'persistent', b'stays', ex=60)
+    assert client.setex(prefix + b'persistent', 60, b'stays')
     assert client.persist(prefix + b'persistent')
     with client.pipeline(transaction=False) as pipe:
         pipe.set(prefix + b'deleted', b'delete me')
@@ -74,10 +73,29 @@ def main():
     p.add_argument('--host', required=True)
     p.add_argument('--port', type=int, default=6380)
     p.add_argument('--prefix', required=True)
-    p.add_argument('--phase', choices=['write', 'verify'], required=True)
+    p.add_argument('--phase', choices=['write', 'verify', 'watch'], required=True)
+    p.add_argument('--seconds', type=float, default=60)
     args = p.parse_args()
     client = connect(args.host, args.port)
     try:
+        if args.phase == 'watch':
+            assert args.seconds > 0
+            verify(client, args.prefix.encode())
+            print(json.dumps({'watch_started': True}), flush=True)
+            deadline = time.monotonic() + args.seconds
+            successes, disconnects = 0, 0
+            while time.monotonic() < deadline:
+                try:
+                    verify(client, args.prefix.encode())
+                    successes += 1
+                except (redis.ConnectionError, redis.TimeoutError):
+                    disconnects += 1
+                time.sleep(.2)
+            verify(client, args.prefix.encode())
+            print(json.dumps({'passed': True, 'phase': 'watch', 'redis_py': redis.__version__,
+                              'seconds': args.seconds, 'successful_checks': successes,
+                              'connection_errors': disconnects}))
+            return
         sequence = exercise(client, args.prefix.encode()) if args.phase == 'write' else None
         verify(client, args.prefix.encode())
         print(json.dumps({'passed': True, 'redis_py': redis.__version__, 'protocol': 2,

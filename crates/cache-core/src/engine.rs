@@ -202,6 +202,24 @@ impl Engine {
                 }
                 return self.put(a[1], a[2], expiry, &mut submit);
             }
+            b"SETEX" | b"PSETEX" if a.len() == 4 => {
+                let Some(ttl) = integer(a[2]) else {
+                    return Reply::Error("ERR value is not an integer or out of range");
+                };
+                let seconds = cmd == b"SETEX";
+                let Some(expiry) = ttl
+                    .checked_mul(if seconds { 1000 } else { 1 })
+                    .filter(|duration| *duration > 0)
+                    .and_then(|duration| now.checked_add(duration))
+                else {
+                    return Reply::Error(if seconds {
+                        "ERR invalid expire time in 'setex' command"
+                    } else {
+                        "ERR invalid expire time in 'psetex' command"
+                    });
+                };
+                return self.put(a[1], a[3], Some(expiry), &mut submit);
+            }
             b"MSET" if a.len() >= 3 && a.len() % 2 == 1 => {
                 for pair in a[1..].chunks_exact(2) {
                     changes.insert(
@@ -224,12 +242,20 @@ impl Engine {
                 }
                 Reply::Integer(count)
             }
-            b"INCR" if a.len() == 2 => {
+            b"INCR" | b"INCRBY" if a.len() == if cmd == b"INCR" { 2 } else { 3 } => {
+                let increment = if cmd == b"INCR" {
+                    1
+                } else {
+                    let Some(increment) = integer(a[2]) else {
+                        return Reply::Error("ERR value is not an integer or out of range");
+                    };
+                    increment
+                };
                 let old = self.get(a[1], now);
                 let Some(n) = old.map_or(Some(0), |e| integer(&e.value)) else {
                     return Reply::Error("ERR value is not an integer or out of range");
                 };
-                let Some(n) = n.checked_add(1) else {
+                let Some(n) = n.checked_add(increment) else {
                     return Reply::Error("ERR increment or decrement would overflow");
                 };
                 changes.insert(
@@ -301,7 +327,8 @@ impl Engine {
                 }
             }
             b"PING" | b"ECHO" | b"GET" | b"MGET" | b"EXISTS" | b"SET" | b"MSET" | b"DEL"
-            | b"INCR" | b"TTL" | b"PTTL" | b"EXPIRE" | b"PEXPIRE" | b"PERSIST" | b"SELECT" => ARITY,
+            | b"INCR" | b"INCRBY" | b"SETEX" | b"PSETEX" | b"TTL" | b"PTTL" | b"EXPIRE"
+            | b"PEXPIRE" | b"PERSIST" | b"SELECT" => ARITY,
             _ => Reply::Error("ERR unknown or unsupported command"),
         };
         if changes.is_empty() {
@@ -414,6 +441,85 @@ mod tests {
             Reply::Simple("OK")
         );
     }
+    #[test]
+    fn expiry_aliases_preserve_atomicity_and_absolute_deadlines() {
+        let mut e = Engine::new(4096);
+        assert_eq!(
+            run(&mut e, &["SETEX", "k", "2", "old"], 100),
+            Reply::Simple("OK")
+        );
+        assert_eq!(run(&mut e, &["PTTL", "k"], 101), Reply::Integer(1999));
+        for ttl in ["0", "-1", "9223372036854775807"] {
+            assert_eq!(
+                run(&mut e, &["SETEX", "k", ttl, "new"], 101),
+                Reply::Error("ERR invalid expire time in 'setex' command")
+            );
+        }
+        assert_eq!(
+            run(&mut e, &["PSETEX", "k", "invalid", "new"], 101),
+            Reply::Error("ERR value is not an integer or out of range")
+        );
+        assert_eq!(
+            e.execute(&[b"PSETEX", b"k", b"10", b"new"], 101, |_| false),
+            Reply::Error("MISCONF persistence backlog full or unavailable")
+        );
+        assert_eq!(
+            run(&mut e, &["GET", "k"], 101),
+            Reply::Bulk(Some(b"old".to_vec()))
+        );
+        assert_eq!(run(&mut e, &["PTTL", "k"], 101), Reply::Integer(1999));
+        let mut persisted = Vec::new();
+        assert_eq!(
+            e.execute(&[b"PSETEX", b"k", b"10", b"new"], 101, |m| {
+                persisted.extend(m);
+                true
+            }),
+            Reply::Simple("OK")
+        );
+        assert_eq!(
+            persisted[0].entry.as_ref().unwrap().expires_at_ms,
+            Some(111)
+        );
+        assert_eq!(run(&mut e, &["GET", "k"], 111), Reply::Bulk(None));
+        e.reap(111);
+        assert_eq!(e.used, 0);
+    }
+
+    #[test]
+    fn increment_by_checks_signed_bounds_and_preserves_ttl_on_rejection() {
+        let mut e = Engine::new(4096);
+        assert_eq!(
+            run(&mut e, &["INCRBY", "k", "-9223372036854775808"], 0),
+            Reply::Integer(i64::MIN)
+        );
+        assert_eq!(
+            run(&mut e, &["INCRBY", "k", "-1"], 0),
+            Reply::Error("ERR increment or decrement would overflow")
+        );
+        assert_eq!(
+            run(&mut e, &["INCRBY", "k", "9223372036854775807"], 0),
+            Reply::Integer(-1)
+        );
+        assert_eq!(run(&mut e, &["PEXPIRE", "k", "100"], 0), Reply::Integer(1));
+        assert_eq!(
+            e.execute(&[b"INCRBY", b"k", b"10"], 1, |_| false),
+            Reply::Error("MISCONF persistence backlog full or unavailable")
+        );
+        assert_eq!(
+            run(&mut e, &["GET", "k"], 1),
+            Reply::Bulk(Some(b"-1".to_vec()))
+        );
+        assert_eq!(run(&mut e, &["PTTL", "k"], 1), Reply::Integer(99));
+        assert_eq!(run(&mut e, &["INCRBY", "k", "2"], 1), Reply::Integer(1));
+        assert_eq!(run(&mut e, &["PTTL", "k"], 1), Reply::Integer(99));
+        assert_eq!(
+            run(&mut e, &["INCRBY", "k", "01"], 1),
+            Reply::Error("ERR value is not an integer or out of range")
+        );
+        assert_eq!(run(&mut e, &["INCRBY", "k", "5"], 100), Reply::Integer(5));
+        assert_eq!(run(&mut e, &["PTTL", "k"], 100), Reply::Integer(-1));
+    }
+
     #[test]
     fn queued_values_remain_immutable_across_overwrites() {
         let mut e = Engine::new(1024);

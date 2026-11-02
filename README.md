@@ -1,6 +1,7 @@
-# pg_cache
+# Flaro (`pg_flaro`)
 
-Experimental PostgreSQL 17 extension written with Rust/pgrx. It serves a documented
+Experimental PostgreSQL 17 extension written with Rust/pgrx. The current SQL
+extension, library, and configuration prefix remain named `pg_cache`. It serves a documented
 Redis RESP2 command subset over TCP, keeps the live dataset in memory, and persists
 writes asynchronously into **ordinary WAL-logged PostgreSQL tables**.
 
@@ -12,7 +13,7 @@ deployment limitations.
 ## Architecture and durability
 
 ```text
-Redis client → loopback TCP / RESP2 → Rust event loop + in-memory map
+Redis client → TCP / RESP2 → Rust event loop + in-memory map
                                          │ bounded FIFO channel
                                          ▼
                                 PostgreSQL worker main thread
@@ -53,10 +54,11 @@ The cache is process-local, with one owner; it is not copied per SQL connection.
   and transaction setup/commit. The maxima can come from different flushes and
   must not be added or subtracted to infer a particular transaction's timing.
 - The target flush interval is not a maximum crash-loss window. Database stalls
-  can increase it. A full queue pauses that connection's command processing for
-  up to 100 ms; if still full, it returns `MISCONF` without applying the command.
-  Reads on other connections continue. Commands on a blocked connection retain
-  their original order.
+  can increase it. A full queue pauses that connection's command processing until
+  persistence releases capacity. Its input remains bounded and reads on other
+  connections continue. Commands on a blocked connection retain their original
+  order. A prolonged database stall therefore increases write latency; client
+  timeouts do not establish whether a queued command was eventually applied.
 - An immediate shutdown or crash can lose every uncommitted write. Already
   committed data recovers from PostgreSQL WAL. Clean shutdown stops the listener,
   joins the network thread, then drains accepted writes.
@@ -69,6 +71,47 @@ The persistence tables are **not UNLOGGED**. Unlogged tables are unsuitable for 
 durability contract because PostgreSQL truncates them after a crash. SQL reads show
 the last flushed state and can include expired rows awaiting cleanup. Direct SQL
 updates to these tables are unsupported and do not invalidate the memory cache.
+
+The entries tables use PostgreSQL hash indexes over the full binary key. PostgreSQL
+rechecks equality after a hash match, so colliding hashes do not identify the same
+key. These indexes avoid the B-tree index-tuple limit for larger keys. Hash indexes
+do not enforce uniqueness: the private writer serializes its exact-key `MERGE`
+operations, and journal compactors share a transaction-scoped advisory lock.
+Direct SQL writes can violate these invariants and remain unsupported. This schema
+revision requires a fresh installation; no in-place migration is provided yet.
+
+### Journal mode used by the CNPG example
+
+The default build writes directly to `cache_store.entries`. The CNPG example
+uses the optional `journal-prototype` build feature and `pg_cache.journal=on`.
+Install both SQL extensions with `make install FEATURES=journal-prototype`, then
+create `pg_cache` and `pg_cache_journal` in the configured database.
+
+In journal mode the persistence worker commits batches into two bounded,
+WAL-logged tables, `cache_journal.segment0` and `segment1`. A separate PostgreSQL
+background worker coalesces a sealed segment's changes and applies them to
+`cache_journal.entries`. It retires that segment and advances the materialized
+sequence in the same transaction. Recovery combines materialized entries with
+committed journal changes, including deletes and absolute expiration times.
+The direct-store tuple-location optimization described below does not run in
+this mode; journal materialization currently uses batched SQL `MERGE` statements.
+Persistence batches temporarily disable hash/merge joins and JIT so freshly
+populated tables use indexed key lookups rather than repeated full-table joins.
+The extension restores the caller's planner settings after the operation.
+
+`PGCACHE.STATS.committed_sequence` measures journal durability, not completion of
+materialization. Inspect `cache_journal.state` for the `materialized` and
+`committed` sequences and the two segment byte counts. SQL queries of
+`cache_journal.entries` alone can lag committed Redis writes. The two modes use
+different storage tables; toggling the setting does not migrate their data.
+
+Sustained write throughput remains a limitation: a three-minute, million-key
+mixed SET/GET test on Linux ARM64 exhausted journal capacity and produced
+`MISCONF` replies under the former 100-ms admission deadline, even with a
+128-MiB pending queue and 1-GiB shared buffers. The current backpressure candidate
+waits for capacity; its sustained throughput and latency remain under validation.
+Short successful runs do not establish sustained Redis parity. Increasing queue
+capacity can absorb bursts but does not increase compaction throughput.
 
 ## Build and run
 
@@ -86,6 +129,22 @@ make install PG_CONFIG=/path/to/postgresql17/bin/pg_config
 `make install` copies the library, control file, and SQL into that PostgreSQL
 installation. Use an appropriate account, or `DESTDIR=/staging/path` to stage a
 package. It does not change configuration or restart any server.
+
+If using the native ARM64 archive instead, its `manifest.json` records file
+checksums and the tested platform: Debian 12, PostgreSQL 17.11. From the extracted
+directory, use the matching PostgreSQL 17 installation's `pg_config`:
+
+```sh
+PG_CONFIG=/path/to/postgresql17/bin/pg_config
+install -m 755 pg_cache.so "$("$PG_CONFIG" --pkglibdir)/pg_cache.so"
+install -m 644 pg_cache.control pg_cache_journal.control \
+  pg_cache--0.1.0.sql pg_cache_journal--0.1.0.sql \
+  "$("$PG_CONFIG" --sharedir)/extension/"
+```
+
+The native archive includes journal support. Enable `pg_cache.journal=on` and
+create both extensions to use the benchmarked journal mode; see the journal-mode
+and CNPG sections. Fresh installation is required for this schema revision.
 
 Add to `postgresql.conf` (append to any existing preload list):
 
@@ -114,10 +173,14 @@ redis-cli -h 127.0.0.1 -p 6380 PGCACHE.STATS
 
 Use RESP2 clients, database 0, no authentication, and disable optional unsupported
 connection handshakes if your library treats their errors as fatal. `HELLO`/RESP3,
-`AUTH`, and `CLIENT` are not implemented. The listener is deliberately restricted
-to `127.0.0.1`; PostgreSQL's `pg_hba.conf` does not authenticate RESP connections.
-Any local process that can connect can read/write the cache. TLS, Redis ACLs,
-multi-tenancy, and remote deployment require additional work.
+`AUTH`, and `CLIENT` are not implemented. The listener defaults to
+`127.0.0.1`; set `pg_cache.listen_address` to an explicit IP (restart required)
+for private remote access. PostgreSQL's `pg_hba.conf` does not authenticate RESP
+connections. Any process that can reach the port can read/write the cache.
+TLS, Redis ACLs and multi-tenancy are not implemented. See
+[CNPG deployment](deploy/cnpg/README.md) for the private Service example and test
+status. With redis-py use `protocol=2` and `pipeline(transaction=False)`;
+`incr()`, `incrby()`, `setex()` and `psetex()` use supported commands.
 
 For a disposable local PostgreSQL test cluster, without installing any system files:
 
@@ -147,9 +210,10 @@ of bulk strings are accepted; inline commands are not supported.
 | `PING`, `ECHO`, `QUIT` | Basic connection commands |
 | `GET`, `MGET` | Missing/expired keys return null bulk strings |
 | `SET` | `NX` or `XX`; `EX seconds` or `PX milliseconds`; overwrites clear old TTL |
+| `SETEX`, `PSETEX` | Atomic value replacement with a positive seconds/milliseconds TTL |
 | `MSET` | Atomic within the cache, including on memory/backlog rejection |
 | `DEL`, `EXISTS` | Multiple keys; Redis duplicate-key counting behavior |
-| `INCR` | Signed 64-bit integer semantics, checked overflow, retains TTL |
+| `INCR`, `INCRBY` | Signed 64-bit integer semantics, checked overflow, retains TTL |
 | `EXPIRE`, `PEXPIRE` | Basic form only; nonpositive TTL deletes immediately |
 | `TTL`, `PTTL`, `PERSIST` | Redis missing/no-expiration sentinel values |
 | `SELECT 0` | Only database 0 |
@@ -168,8 +232,10 @@ Malformed/unsupported syntax errors are not all byte-for-byte Redis matches.
 - Maximum command frame: 1 MiB; maximum arguments: 1,024; maximum clients: 128.
   Slow clients are disconnected when queued responses exceed 2 MiB. Large `MGET`
   responses are rejected before copying values if they would exceed the limit.
-- Pending mutations: at most 16 MiB by payload accounting, including staged,
-  queued, and currently committing mutations. Staged writes are handed off even
+- Pending mutations: direct mode permits 16 MiB by payload accounting. Journal
+  mode defaults to 16 MiB and allows 16–128 MiB through
+  `pg_cache.journal_pending_mb`. Accounting includes staged, queued, and currently
+  committing mutations. Staged writes are handed off even
   when clients disconnect or send no more commands; clean shutdown hands off all
   remaining staged writes. The writer receives grouped event-loop
   handoffs, draining at most 1,024 additional handoffs before rechecking flush and
@@ -180,17 +246,19 @@ Malformed/unsupported syntax errors are not all byte-for-byte Redis matches.
   drains the remaining queue in one transaction.
   No eviction: memory-full writes receive `OOM`.
 - Expiration is checked on reads; a full memory expiration sweep runs each second.
-  Up to 1,000 expired persisted entries are deleted every minute. High TTL churn
+  Direct mode deletes up to 1,000 expired persisted entries every minute. Journal
+  mode filters expired values during recovery but has no periodic table expiry
+  sweep; expired table rows can remain until overwritten or deleted. High TTL churn
   needs a better expiration index/scheduler and more effective disk cleanup.
-- Existing keys use validated tuple-location hints and PostgreSQL's heap/index
-  update helpers. New keys and stale hints use typed-array SQL upsert; deletes
+- In direct mode, existing keys use validated tuple-location hints and PostgreSQL's heap/index
+  update helpers. New keys and stale hints use typed-array SQL `MERGE`; deletes
   use SQL. Values are never interpolated into SQL text. Hints are installed only
   after commit and have a separate 8-MiB accounting cap (key length plus 128 bytes
   per hint). Reaching the cap clears the hints; this can reduce performance on
   larger keyspaces. Frequent updates still generate WAL, dead tuples, and
   autovacuum work.
-- The native path verifies the exact plain-heap column layout and one immediate
-  primary index. Extra indexes, triggers, check constraints, RLS, or other
+- The native path verifies the exact plain-heap column layout and one plain hash
+  index on the key. Extra indexes, triggers, check constraints, RLS, or other
   incompatible metadata cause SQL fallback. It holds a table lock that serializes
   writers and maintenance during the batch; ordinary SQL readers remain allowed.
   Stale hints after row changes or physical rewrites are validated against the key
@@ -201,8 +269,84 @@ Malformed/unsupported syntax errors are not all byte-for-byte Redis matches.
 - Disable preload and restart before dropping the extension or modifying its
   storage schema. Lifecycle DDL coordination and upgrades are not implemented.
 
+## Linux ARM64 performance validation
+
+The current hash-index/journal build was compared with Redis 8.2.11 using Redis
+AOF `appendfsync everysec` and PostgreSQL 17.11 WAL-logged write-behind storage.
+Measurements used one dedicated OCI A1 host with 4 CPU cores, 24 GiB RAM and a
+500 GiB Balanced block volume. Clients and servers shared that host and used
+loopback connections. PostgreSQL used 1 GiB shared buffers, 4 GiB `max_wal_size`,
+a 512 MiB cache, a 128 MiB pending-write limit and two 256 MiB journal segments.
+CNPG deployment tests were separate from these timing measurements.
+
+Unmodified memtier 2.5.2 ran a 50/50 SET/GET workload with one million keys,
+32-byte repeated payloads, pipeline 10, and 100 connections across four client
+threads. Each server ran for 180 seconds per round, with alternating server order
+over three rounds. Medians were:
+
+| Metric | Flaro | Redis |
+|---|---:|---:|
+| Operations/s | 586,618 | 390,423 |
+| p99 latency | 5.471 ms | 7.551 ms |
+| p99.9 latency | 13.375 ms | 12.799 ms |
+| Trailing durability barrier | 124 ms | 262 ms |
+| Whole test cgroup CPU usage, including client | 3.04 cores | 1.87 cores |
+
+Flaro delivered 1.50× throughput in this workload, with higher CPU usage and a
+slightly higher p99.9. All rounds passed zero-error/miss checks, exact accepted
+write counts, durability barriers and full PostgreSQL materialization. All one
+million workload keys were verified after PostgreSQL restart.
+
+The **unmodified stock Redis 8.2.11 benchmark** also ran three repetitions with
+10,000 keys, 50 connections, one client thread and two million requests per
+command. Flaro was faster in five of eight cases, including every pipelined case,
+but 3–6% slower on small unpipelined operations and 4 KiB unpipelined reads:
+
+| Value bytes | Pipeline | Command | Flaro median ops/s | Redis median ops/s | Ratio |
+|---:|---:|---|---:|---:|---:|
+| 64 | 1 | GET | 95,324 | 98,707 | 0.97× |
+| 64 | 1 | SET | 96,297 | 102,323 | 0.94× |
+| 64 | 16 | GET | 1,305,483 | 990,589 | 1.32× |
+| 64 | 16 | SET | 839,983 | 518,135 | 1.62× |
+| 4096 | 1 | GET | 85,970 | 90,510 | 0.95× |
+| 4096 | 1 | SET | 74,358 | 43,609 | 1.71× |
+| 4096 | 16 | GET | 415,110 | 349,956 | 1.19× |
+| 4096 | 16 | SET | 203,169 | 56,400 | 3.60× |
+
+All stock-client cases passed error, accepted-write count, durability and full
+materialization checks. The stock and modified-client results below use different
+payload behavior and client thread counts and should be assessed separately.
+
+A separate **modified** Redis benchmark client generated fresh binary bytes for
+every SET, used a monotonic clock and checked latency sample counts. This is not
+the stock Redis benchmark. It used 10,000 keys, 50 connections, two client threads,
+two million requests per command and three repetitions per case:
+
+| Value bytes | Pipeline | Command | Flaro median ops/s | Redis median ops/s | Ratio |
+|---:|---:|---|---:|---:|---:|
+| 64 | 1 | GET | 156,556 | 137,504 | 1.14× |
+| 64 | 1 | SET | 139,733 | 114,976 | 1.22× |
+| 64 | 16 | GET | 1,392,758 | 995,520 | 1.40× |
+| 64 | 16 | SET | 841,751 | 523,697 | 1.61× |
+| 4096 | 1 | GET | 109,721 | 100,346 | 1.09× |
+| 4096 | 1 | SET | 86,666 | 45,725 | 1.90× |
+| 4096 | 16 | GET | 416,146 | 352,858 | 1.18× |
+| 4096 | 16 | SET | 219,563 | 56,820 | 3.86× |
+
+Every case passed error, accepted-write count, durability and full materialization
+checks. Higher throughput did not imply lower latency at every percentile:
+64-byte pipeline-1 SET p99 was 0.791 ms versus Redis's 0.735 ms.
+4 KiB GET p99.9 was 2.711/6.831 ms for Flaro versus 2.055/6.015 ms for Redis at
+pipeline 1/16. Pipelined latency samples describe batches rather than independent
+command timings. Both systems acknowledged writes before durability; trailing
+barriers were measured separately from foreground latency. These results cover
+the stated workloads and do not establish performance for other commands,
+concurrency levels, hardware or network paths.
+
 References: [pgrx background workers](https://docs.rs/pgrx/0.16.1/pgrx/bgworkers/index.html),
 [PostgreSQL background workers](https://www.postgresql.org/docs/17/bgworker.html),
+[PostgreSQL hash indexes](https://www.postgresql.org/docs/17/hash-index.html),
+[PostgreSQL MERGE](https://www.postgresql.org/docs/17/sql-merge.html),
 [Redis RESP](https://redis.io/docs/latest/develop/reference/protocol-spec/),
 [Redis benchmarking](https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/benchmarks/).
 

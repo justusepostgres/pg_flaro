@@ -14,6 +14,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -109,6 +110,26 @@ def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def hash_collision_keys(sql, schema="cache_store"):
+    """Find distinct bytea keys sharing PostgreSQL's actual 32-bit index hash."""
+    assert schema in ("cache_store", "cache_journal")
+    implementation = sql("SELECT p.prosrc FROM pg_amproc a JOIN pg_opclass c ON c.opcfamily=a.amprocfamily JOIN pg_am m ON m.oid=c.opcmethod JOIN pg_proc p ON p.oid=a.amproc WHERE m.amname='hash' AND c.opcintype='bytea'::regtype AND a.amprocnum=1")
+    assert implementation == 'hashvarlena', implementation
+    # The built-in support function is not exposed with a bytea SQL signature.
+    # This alias exists only in this disposable test database and is removed.
+    sql(f"CREATE FUNCTION {schema}.test_hash_bytea(bytea) RETURNS integer LANGUAGE internal IMMUTABLE STRICT AS 'hashvarlena'")
+    try:
+        for count in (200000, 1000000):
+            result = sql(f"WITH hashes AS MATERIALIZED (SELECT int8send(n) AS key, {schema}.test_hash_bytea(int8send(n)) AS h FROM generate_series(1,{count}::bigint) n), collision AS (SELECT h FROM hashes GROUP BY h HAVING count(*)>1 LIMIT 1) SELECT json_agg(encode(key,'hex')) FROM (SELECT key FROM hashes WHERE h=(SELECT h FROM collision) LIMIT 2) pair")
+            if result and result != 'null':
+                keys = [bytes.fromhex(key) for key in json.loads(result)]
+                assert len(keys) == 2 and keys[0] != keys[1]
+                return keys
+        raise AssertionError('No PostgreSQL hash collision fixture found')
+    finally:
+        sql(f'DROP FUNCTION {schema}.test_hash_bytea(bytea)')
 
 
 def eventually(fn, timeout=15):
@@ -225,7 +246,7 @@ def main():
         sql("DELETE FROM cache_store.entries WHERE key=convert_to('hint:y','UTF8')")
         assert c.cmd("MSET", "hint:z", "after-z", "hint:y", "after-y") == b"OK"
         eventually(lambda: drained(c))
-        sql("CLUSTER cache_store.entries USING entries_pkey")
+        sql("CREATE INDEX hint_cluster_idx ON cache_store.entries(expires_at_ms); CLUSTER cache_store.entries USING hint_cluster_idx; DROP INDEX cache_store.hint_cluster_idx")
         assert c.cmd("MSET", "hint:z", "final-z", "hint:y", "final-y", "hint:x", "final-x") == b"OK"
         eventually(lambda: drained(c))
         assert sql("SELECT string_agg(convert_from(value,'UTF8'), ',' ORDER BY key) FROM cache_store.entries WHERE key IN (convert_to('hint:x','UTF8'),convert_to('hint:y','UTF8'),convert_to('hint:z','UTF8'))") == "final-x,final-y,final-z"
@@ -278,6 +299,30 @@ def main():
         eventually(lambda: drained(c))
         assert sql("SELECT expires_at_ms IS NULL FROM cache_store.entries WHERE key=convert_to('toast-key','UTF8')") == "t"
 
+        # Binary keys must not inherit the B-tree index-tuple size limit.
+        large_key = os.urandom(4096)
+        large_values = {large_key: b'large-a',
+                        large_key[:-1] + bytes([large_key[-1] ^ 1]): b'large-b',
+                        os.urandom(65536): b'large-c',
+                        os.urandom(1024 * 1024 - 128): b'large-d'}
+        collision_a, collision_b = hash_collision_keys(sql)
+        large_values.update({collision_a: b'collision-a', collision_b: b'collision-b'})
+        for key in large_values:
+            assert c.cmd('SET', key, b'old') == b'OK'
+        eventually(lambda: drained(c))
+        for key, value in large_values.items():
+            assert c.cmd('SET', key, value) == b'OK'
+        eventually(lambda: drained(c))
+        assert sql('SELECT count(*) FROM cache_store.entries WHERE octet_length(key) IN (4096,65536,1048448)') == '4'
+        for key, value in large_values.items():
+            assert c.cmd('GET', key) == value
+        collision_sql = f"key IN (decode('{collision_a.hex()}','hex'),decode('{collision_b.hex()}','hex'))"
+        assert sql(f'SELECT count(*) FROM cache_store.entries WHERE {collision_sql}') == '2'
+        assert c.cmd('DEL', collision_a) == 1
+        del large_values[collision_a]
+        eventually(lambda: drained(c))
+        assert sql(f'SELECT count(*) FROM cache_store.entries WHERE {collision_sql}') == '1'
+
         # An acknowledged write must leave local staging even if its client
         # closes and no further RESP traffic arrives to wake the event loop.
         short_client = Client(redis_port)
@@ -285,24 +330,40 @@ def main():
         short_client.close()
         eventually(lambda: sql("SELECT convert_from(value,'UTF8') FROM cache_store.entries WHERE key=convert_to('disconnect-staged','UTF8')") == "kept")
 
-        # Block the table writer, fill the bounded queue, and verify failed writes
-        # never appear in memory. Other clients can still read while SPI is blocked.
+        # Hold persistence beyond the former 100 ms rejection deadline. The writer
+        # must pause with bounded reservations while unrelated reads still work.
         lock = lock_table("cache_store.entries")
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = None
         try:
             assert c.cmd("SET", "backlog-barrier", "blocked") == b"OK"
             eventually(lambda: sql("SELECT count(*) FROM pg_stat_activity WHERE backend_type='pg_cache' AND wait_event_type='Lock'") == "1")
-            c.socket.sendall(b"".join(frame("SET", "backpressure", str(n).encode() + b"x" * 4096) for n in range(6000)))
+            def pipeline():
+                c.socket.settimeout(30)
+                c.socket.sendall(b"".join(frame("SET", "backpressure", str(n).encode() + b"x" * 4096) for n in range(6000)))
+                return [c.read() for _ in range(6000)]
+            future = executor.submit(pipeline)
             reader = Client(redis_port)
-            assert reader.cmd("GET", "a") == b"2"
-            reader.close()
-            replies = [c.read() for _ in range(6000)]
-            accepted = [i for i, r in enumerate(replies) if r == b"OK"]
-            assert accepted and any(isinstance(r, RedisError) for r in replies)
-            assert c.cmd("GET", "backpressure") == (str(accepted[-1]).encode() + b"x" * 4096)
-            assert c.cmd("GET", "a") == b"2"
+            try:
+                eventually(lambda: json.loads(reader.cmd("PGCACHE.STATS"))["pending_bytes"] > 16 * 1024**2 - 8192)
+                before = json.loads(reader.cmd("PGCACHE.STATS"))
+                time.sleep(.3)
+                after = json.loads(reader.cmd("PGCACHE.STATS"))
+                assert not future.done(), "blocked pipeline completed before persistence resumed"
+                assert before["accepted_sequence"] == after["accepted_sequence"]
+                assert after["pending_bytes"] <= 16 * 1024**2
+                assert reader.cmd("GET", "a") == b"2"
+                assert reader.cmd("GET", "backpressure") != b"5999" + b"x" * 4096
+            finally:
+                reader.close()
         finally:
             lock.stdin.write("ROLLBACK;\n\\q\n"); lock.stdin.flush()
             lock.communicate(timeout=5)
+            executor.shutdown(wait=True)
+        replies = future.result(timeout=30)
+        assert all(reply == b"OK" for reply in replies)
+        accepted = list(range(6000))
+        assert c.cmd("GET", "backpressure") == b"5999" + b"x" * 4096
         eventually(lambda: drained(c))
         c.close()
 
@@ -318,6 +379,9 @@ def main():
         assert c.cmd("GET", "b") is None
         assert c.cmd("GET", "gone") is None
         assert c.cmd("GET", "backpressure") == (str(accepted[-1]).encode() + b"x" * 4096)
+        for key, value in large_values.items():
+            assert c.cmd('GET', key) == value
+        assert c.cmd('GET', collision_a) is None
         assert c.cmd("GET", "toast-key") == toast_after
         # Graceful shutdown must drain acknowledged pending writes too.
         assert c.cmd("SET", "graceful", "retained") == b"OK"

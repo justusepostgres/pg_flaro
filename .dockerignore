@@ -1,0 +1,9 @@
+**
+!Cargo.toml
+!Cargo.lock
+!Makefile
+!crates/
+!crates/**
+!deploy/
+!deploy/cnpg/
+!deploy/cnpg/Dockerfile

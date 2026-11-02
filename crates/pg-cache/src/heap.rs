@@ -3,7 +3,7 @@ use pgrx::{pg_sys, FromDatum, IntoDatum, Spi};
 use std::ffi::CStr;
 
 // CatalogTupleUpdateWithInfo omits general executor constraints/triggers. Accept
-// exactly our plain heap and immediate one-column primary index; otherwise SQL
+// exactly our plain heap and one-column hash index; otherwise SQL
 // handles every row. The caller holds a lock excluding DML and schema changes.
 unsafe fn compatible(relation: pg_sys::Relation, indexes: pg_sys::CatalogIndexState) -> bool {
     let class = &*(*relation).rd_rel;
@@ -42,9 +42,9 @@ unsafe fn compatible(relation: pg_sys::Relation, indexes: pg_sys::CatalogIndexSt
     let index = *(*indexes).ri_IndexRelationDescs;
     let info = &**(*indexes).ri_IndexRelationInfo;
     let definition = &*(*index).rd_index;
-    (*(*index).rd_rel).relam == pg_sys::BTREE_AM_OID
-        && definition.indisprimary
-        && definition.indisunique
+    (*(*index).rd_rel).relam == pg_sys::HASH_AM_OID
+        && !definition.indisprimary
+        && !definition.indisunique
         && definition.indimmediate
         && definition.indisvalid
         && definition.indisready

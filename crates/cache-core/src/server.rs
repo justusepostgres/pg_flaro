@@ -202,7 +202,6 @@ struct Client {
     output: Vec<u8>,
     written: usize,
     closing: bool,
-    blocked_since: Option<Instant>,
     writable: bool,
     readable: bool,
 }
@@ -240,17 +239,16 @@ impl Client {
                     } else {
                         engine.execute(&args, now_ms(), |m| sink.submit(m))
                     };
-                    if reply == Reply::Error("MISCONF persistence backlog full or unavailable") {
-                        let since = self.blocked_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() < Duration::from_millis(100) {
-                            // The rejected command has changed no state. Retain
-                            // its frame and retry after the writer makes room.
-                            // Other connections, including reads, keep running.
-                            blocked = true;
-                            break;
-                        }
-                    } else {
-                        self.blocked_since = None;
+                    if reply == Reply::Error("MISCONF persistence backlog full or unavailable")
+                        && sink.accepted < i64::MAX as u64
+                    {
+                        // Admission has changed no state. Keep this command in
+                        // the bounded input buffer until persistence makes room;
+                        // read interest is disabled while it is deferred. Other
+                        // connections can still read. Sequence exhaustion is
+                        // permanent and must return an error instead of waiting.
+                        blocked = true;
+                        break;
                     }
                     consumed += n;
                     reply.encode(&mut self.output);
@@ -397,7 +395,6 @@ pub fn serve(
                                     output: Vec::new(),
                                     written: 0,
                                     closing: false,
-                                    blocked_since: None,
                                     writable: false,
                                     readable: true,
                                 },

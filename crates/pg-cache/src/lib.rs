@@ -5,6 +5,7 @@ mod journal_copy;
 mod journal_store;
 #[cfg(feature = "journal-prototype")]
 mod journal_worker;
+mod point_lookup;
 mod storage;
 use pg_cache_core::{
     engine::{Engine, Entry},
