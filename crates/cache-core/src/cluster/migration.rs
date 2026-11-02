@@ -89,7 +89,7 @@ impl Cluster {
         };
         // Commit prior source writes first: a failed transfer must not weaken their
         // durability. The network loop is paused until the source deletion commits.
-        sink.barrier()?;
+        sink.barrier(engine)?;
         let token = if let Some(p) = &self.topology.pending {
             p.token
         } else {
@@ -136,13 +136,18 @@ impl Cluster {
         }
         // A timeout here is fatal. Serving the in-memory deletion before it is
         // durable could resurrect an old value after the target accepts updates.
-        sink.barrier()?;
+        sink.barrier(engine)?;
         let mut next = self.topology.clone();
         next.pending = None;
         self.persist(next)?;
         Ok(Reply::Simple("OK"))
     }
-    pub(super) fn finish(&mut self, args: &[&[u8]], sink: &mut Sink) -> io::Result<Reply> {
+    pub(super) fn finish(
+        &mut self,
+        args: &[&[u8]],
+        engine: &Engine,
+        sink: &mut Sink,
+    ) -> io::Result<Reply> {
         if args.len() != 4 {
             return Ok(Reply::Error("ERR wrong number of arguments"));
         }
@@ -170,7 +175,7 @@ impl Cluster {
         if self.topology.importing.get(&slot) != Some(&source) {
             return Ok(Reply::Error("ERR slot is not importing from this source"));
         }
-        sink.barrier()?;
+        sink.barrier(engine)?;
         let mut next = self.topology.clone();
         next.imported.insert(source, token);
         self.persist(next)?;
@@ -247,7 +252,7 @@ impl Cluster {
             &mut |m| sink.submit(m),
         );
         if result == Reply::Simple("OK") {
-            sink.barrier()?;
+            sink.barrier(engine)?;
             let mut next = self.topology.clone();
             next.imported.insert(source, token);
             self.persist(next)?;

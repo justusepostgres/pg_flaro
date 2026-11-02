@@ -64,8 +64,18 @@ an experimental startup migration, not a general rolling-upgrade framework.
 
 Ordinary writes retain the chosen write-behind contract: acknowledgment precedes
 commit. Committed snapshots recover through PostgreSQL WAL; recent uncommitted
-writes can be lost. Pending snapshots are immutable, so a later in-memory mutation
-cannot change the value being persisted by an earlier batch.
+writes can be lost. Snapshots handed to persistence are immutable, so a later in-memory mutation
+cannot change the value being persisted by an earlier batch. Single-item `HSET`,
+`LSET`, `SADD`, `SREM`, and `ZINCRBY` reserve their full updated size before
+changing live data. Their dirty keys are captured at handoff; rejected admission
+leaves live data unchanged. Cluster durability barriers capture dirty keys before
+waiting for commit.
+
+Collection-only handoffs use `flush_ms` (at least 5 ms), or happen earlier under
+memory pressure. Mixed/string batches retain the 5-ms handoff window. The SQL
+worker still flushes on its interval or capacity threshold; these intervals are
+batching targets, not a maximum crash-loss window or a durability guarantee.
+The old journal byte accounting remains stable across this memory-layout change.
 
 ## Cluster behavior
 
@@ -81,15 +91,22 @@ and absolute expiry using the same durable commit/replay protocol as strings.
   estimated memory cost of a collection entry must not exceed 8 MiB. The global
   cache memory budget still applies. Oversized mutations return an error atomically.
 - Accounting includes encoded bytes, decoded payload sizes, and estimated per-item
-  structure overhead; it is conservative accounting, not an exact RSS limit.
+  structure overhead, plus an 8-KiB allowance per collection for tree roots and
+  vector chunks; it is conservative accounting, not an exact RSS limit.
 - Requests remain limited to 1,024 arguments. Large array replies are rejected
   before exceeding the 2-MiB output budget.
-- Each successful collection mutation creates an immutable snapshot and serializes
-  the whole collection for write-behind persistence. Mutation work therefore grows
-  with collection size. Sorted sets maintain both member and score indexes, but
-  rank/range queries currently traverse the ordered index.
-- These data types have **not been benchmarked against Redis**. The earlier string
-  benchmarks do not establish equivalent collection throughput or complexity.
+- Hashes, sets and sorted-set member lookup use flat hash tables. Lists and sorted
+  score indexes use structurally shared vectors and ordered trees. The single-item
+  fast paths above update private data in place between handoffs. The first write
+  sharing a handed-off hash table clones that table; other collection commands
+  still prepare an atomic copy before admission. This can cause size-dependent
+  latency spikes and means these commands do not all have Redis's complexity.
+  Full serialization is deferred until persistence or migration needs it. The
+  persisted representation is still a whole collection, so flushing large,
+  frequently changed collections can amplify WAL and CPU work. Rank/range queries
+  currently traverse the ordered score index.
+- Redis performance depends on collection size, command, pipeline depth, and flush
+  settings. Earlier string benchmarks do not establish collection performance.
 - Unsupported examples include blocking list operations, `LMOVE`/`RPOPLPUSH`,
   `LINSERT`/`LPOS`, `SMOVE`, random-member/pop commands, cursor scans, hash-field TTLs,
   `HINCRBYFLOAT`, sorted-set algebra, `BYLEX`, `ZRANGESTORE`, and blocking/multi-key
@@ -97,7 +114,7 @@ and absolute expiry using the same durable commit/replay protocol as strings.
 
 ## Validation
 
-Validated on macOS ARM64 / PostgreSQL 17.11: 43 Rust tests and 1,346 deterministic
+Validated on macOS ARM64 / PostgreSQL 17.11: 49 Rust tests and 1,346 deterministic
 and randomized Redis comparisons in each persistence mode, using Redis 8.2.11
 and redis-py 6.4.0. They cover binary values, wrong types, duplicate members,
 negative indexes, score ordering, conditional updates, empty-key deletion,

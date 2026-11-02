@@ -1,3 +1,4 @@
+mod collection_write;
 use crate::protocol::Reply;
 use std::{
     collections::{HashMap, HashSet},
@@ -57,6 +58,10 @@ const SYNTAX: Reply = Reply::Error("ERR syntax error");
 const ARITY: Reply = Reply::Error("ERR wrong number of arguments");
 
 impl Engine {
+    pub(crate) fn snapshot(&self, key: &[u8]) -> Option<Entry> {
+        self.entries.get(key).cloned()
+    }
+
     pub fn new(limit: usize) -> Self {
         Self {
             entries: HashMap::new(),

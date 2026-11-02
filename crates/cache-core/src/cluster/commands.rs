@@ -134,7 +134,7 @@ impl Cluster {
             return self.migrate(args, engine, sink).map(Some);
         }
         if args[0].eq_ignore_ascii_case(b"PGCACHE.FINISH") {
-            return self.finish(args, sink).map(Some);
+            return self.finish(args, engine, sink).map(Some);
         }
         if args[0].eq_ignore_ascii_case(b"PGCACHE.IMPORT") {
             return self.import(args, engine, sink).map(Some);
@@ -258,7 +258,7 @@ impl Cluster {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("cluster epoch exhausted"))?;
         // Persist earlier key writes before publishing metadata which depends on them.
-        sink.barrier()?;
+        sink.barrier(engine)?;
         self.persist(next)?;
         Ok(Reply::Simple("OK"))
     }

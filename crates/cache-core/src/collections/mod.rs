@@ -1,6 +1,6 @@
 mod hash;
 mod list;
-mod score;
+pub(crate) mod score;
 mod set;
 mod zset;
 use crate::{

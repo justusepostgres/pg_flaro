@@ -37,8 +37,11 @@ pub struct Sink {
     accepted: u64,
     staged: Vec<Mutation>,
     staged_bytes: usize,
+    staged_costs: Vec<usize>,
+    deferred_collections: HashSet<usize>,
     staged_collections: HashMap<crate::engine::Bytes, usize>,
     staged_since: Option<Instant>,
+    collection_delay: Duration,
 }
 pub fn channel(sequence: u64) -> (Sink, Receiver) {
     channel_mode(sequence, false)
@@ -65,30 +68,72 @@ pub fn channel_with_limit(
             accepted: sequence,
             staged: Vec::new(),
             staged_bytes: 0,
+            staged_costs: Vec::new(),
+            deferred_collections: HashSet::new(),
             staged_collections: HashMap::new(),
             staged_since: None,
+            collection_delay: HANDOFF_DELAY,
         },
         rx,
     )
 }
 impl Sink {
+    pub fn set_collection_delay(&mut self, delay: Duration) {
+        self.collection_delay = delay.max(HANDOFF_DELAY);
+    }
     pub fn pending_limit(&self) -> usize {
         self.pending_limit
     }
 
+    pub(crate) fn reserve_collection(&mut self, key: &[u8], bytes: usize) -> bool {
+        if let Some(&index) = self.staged_collections.get(key) {
+            let Some(sequence) = self
+                .accepted
+                .checked_add(1)
+                .filter(|n| *n <= i64::MAX as u64)
+            else {
+                return false;
+            };
+            let previous = self.staged_costs[index];
+            if self
+                .pending
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    n.checked_sub(previous)
+                        .and_then(|n| n.checked_add(bytes))
+                        .filter(|n| *n <= self.pending_limit)
+                })
+                .is_err()
+            {
+                return false;
+            }
+            self.staged[index].entry = None;
+            self.staged_costs[index] = bytes;
+            self.deferred_collections.insert(index);
+            self.staged_bytes = self.staged_bytes - previous + bytes;
+            self.accepted = sequence;
+            return true;
+        }
+        self.stage(
+            smallvec::smallvec![Mutation {
+                key: key.into(),
+                entry: None
+            }],
+            Some(bytes),
+        )
+    }
     pub(crate) fn submit(&mut self, mutations: Mutations) -> bool {
-        let bytes: usize = mutations.iter().map(Mutation::bytes).sum();
-        // Only single-key collection snapshots use local replacement. Multi-key
-        // commands invalidate the index so their ordering remains unambiguous.
-        let typed = mutations.len() == 1
-            && mutations[0]
-                .entry
-                .as_ref()
-                .is_some_and(|e| e.value.kind() != 0);
-        let replacement = typed
-            .then(|| self.staged_collections.get(&mutations[0].key).copied())
-            .flatten();
-        let reclaimed = replacement.map_or(0, |i| self.staged[i].bytes());
+        self.stage(mutations, None)
+    }
+    fn stage(&mut self, mutations: Mutations, deferred_bytes: Option<usize>) -> bool {
+        // Engine mutation lists contain unique keys. Once a key has a deferred
+        // snapshot, all later writes to that key replace it until the handoff.
+        let bytes: usize =
+            deferred_bytes.unwrap_or_else(|| mutations.iter().map(Mutation::bytes).sum());
+        let reclaimed: usize = mutations
+            .iter()
+            .filter_map(|m| self.staged_collections.get(&m.key))
+            .map(|i| self.staged_costs[*i])
+            .sum();
         let Some(sequence) = self
             .accepted
             .checked_add(1)
@@ -110,24 +155,36 @@ impl Sink {
         if self.staged.is_empty() {
             self.staged_since = Some(Instant::now());
         }
-        if let Some(index) = replacement {
-            self.staged[index] = mutations.into_iter().next().unwrap();
-        } else {
-            for mutation in mutations {
+        for mutation in mutations {
+            let cost = deferred_bytes.unwrap_or_else(|| mutation.bytes());
+            let typed = deferred_bytes.is_some()
+                || mutation.entry.as_ref().is_some_and(|e| e.value.kind() != 0);
+            let index = self.staged_collections.get(&mutation.key).copied();
+            let index = if let Some(index) = index {
+                self.staged[index] = mutation;
+                self.staged_costs[index] = cost;
+                index
+            } else {
+                let index = self.staged.len();
                 if typed {
-                    self.staged_collections
-                        .insert(mutation.key.clone(), self.staged.len());
-                } else {
-                    self.staged_collections.remove(&mutation.key);
+                    self.staged_collections.insert(mutation.key.clone(), index);
                 }
                 self.staged.push(mutation);
+                self.staged_costs.push(cost);
+                index
+            };
+            if deferred_bytes.is_some() {
+                self.deferred_collections.insert(index);
+            } else {
+                self.deferred_collections.remove(&index);
             }
         }
         self.staged_bytes = self.staged_bytes - reclaimed + bytes;
         self.accepted = sequence;
         true
     }
-    pub(crate) fn barrier(&mut self) -> io::Result<()> {
+    pub(crate) fn barrier(&mut self, engine: &Engine) -> io::Result<()> {
+        self.capture(engine);
         self.flush()?;
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.committed.load(Ordering::Acquire) < self.accepted {
@@ -140,7 +197,27 @@ impl Sink {
         }
         Ok(())
     }
+    fn capture(&mut self, engine: &Engine) {
+        for index in self.deferred_collections.drain() {
+            let mutation = &mut self.staged[index];
+            mutation.entry = engine.snapshot(&mutation.key);
+            let actual = mutation.bytes();
+            assert!(
+                actual <= self.staged_costs[index],
+                "unreserved collection growth"
+            );
+            let released = self.staged_costs[index] - actual;
+            self.pending.fetch_sub(released, Ordering::Relaxed);
+            self.staged_bytes -= released;
+            self.staged_costs[index] = actual;
+        }
+    }
     fn flush(&mut self) -> io::Result<()> {
+        assert!(
+            self.deferred_collections.is_empty(),
+            "capture collections before handoff"
+        );
+        self.staged_costs.clear();
         if self.staged.is_empty() {
             return Ok(());
         }
@@ -159,16 +236,22 @@ impl Sink {
     fn handoff_wait(&self) -> Duration {
         self.staged_since
             .map_or(Duration::from_millis(25), |since| {
-                HANDOFF_DELAY.saturating_sub(since.elapsed())
+                let delay = if self.staged_collections.len() == self.staged.len() {
+                    self.collection_delay
+                } else {
+                    HANDOFF_DELAY
+                };
+                delay.saturating_sub(since.elapsed())
             })
     }
-    fn flush_if_due(&mut self) -> io::Result<()> {
+    fn flush_if_due(&mut self, engine: &Engine) -> io::Result<()> {
         let threshold = if self.staged_collections.is_empty() {
             HANDOFF_BYTES
         } else {
             self.pending_limit / 4
         };
         if self.staged_bytes >= threshold || self.handoff_wait().is_zero() {
+            self.capture(engine);
             self.flush()?;
         }
         Ok(())
@@ -339,7 +422,9 @@ impl Client {
                         self.closing = true;
                         Reply::Simple("OK")
                     } else {
-                        engine.execute(&args, now_ms(), |m| sink.submit(m))
+                        engine
+                            .execute_collection_in_place(&args, now_ms(), sink)
+                            .unwrap_or_else(|| engine.execute(&args, now_ms(), |m| sink.submit(m)))
                     };
                     if reply == Reply::Error("MISCONF persistence backlog full or unavailable")
                         && sink.accepted < i64::MAX as u64
@@ -543,7 +628,7 @@ pub fn serve_cluster(
         }
         // Small writes share a bounded staging window to avoid waking the
         // persistence thread on every socket poll. Reservations cover staging.
-        sink.flush_if_due()?;
+        sink.flush_if_due(&engine)?;
         for (token, read_result) in serviced.drain(..) {
             let Some(client) = clients.get_mut(&token) else {
                 continue;
@@ -575,6 +660,7 @@ pub fn serve_cluster(
             }
         }
     }
+    sink.capture(&engine);
     sink.flush()?;
     Ok(())
 }
@@ -583,6 +669,125 @@ pub fn serve_cluster(
 mod tests {
     use super::*;
     use crate::engine::Entry;
+
+    #[test]
+    fn collection_handoff_captures_at_configured_interval() {
+        let (mut sink, rx) = channel(0);
+        sink.set_collection_delay(Duration::from_millis(100));
+        let mut live = Engine::new(1 << 20);
+        live.execute(&[b"HSET", b"h", b"f", b"old"], 1000, |m| sink.submit(m));
+        live.execute_collection_in_place(&[b"HSET", b"h", b"f", b"new"], 1000, &mut sink);
+        assert!(sink.handoff_wait() > Duration::from_millis(50));
+        sink.flush_if_due(&live).unwrap();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        sink.staged_since = Some(Instant::now() - Duration::from_millis(101));
+        sink.flush_if_due(&live).unwrap();
+        let batch = rx.recv().unwrap();
+        assert_eq!(batch.sequence, 2);
+        assert_eq!(batch.mutations[0].entry, live.snapshot(b"h"));
+        drop(batch);
+        assert_eq!(sink.pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deferred_mutations_match_generic_execution_and_keep_committing_snapshots() {
+        let (mut sink, rx) = channel(0);
+        let mut live = Engine::new(32 << 20);
+        let mut reference = Engine::new(32 << 20);
+        let commands: Vec<Vec<&[u8]>> = vec![
+            vec![b"HSET", b"h", b"f", b"initial"],
+            vec![b"HSET", b"h", b"f", b"next"],
+            vec![b"HSET", b"h", b"new", b"longer"],
+            vec![b"RPUSH", b"l", b"a", b"b"],
+            vec![b"LSET", b"l", b"-1", b"replacement"],
+            vec![b"LSET", b"l", b"0", b""],
+            vec![b"SADD", b"s", b"a", b"b"],
+            vec![b"SREM", b"s", b"a"],
+            vec![b"SADD", b"s", b"new"],
+            vec![b"SADD", b"s", b"new"],
+            vec![b"ZADD", b"z", b"1", b"a"],
+            vec![b"ZINCRBY", b"z", b"2", b"a"],
+            vec![b"ZINCRBY", b"z", b"-1", b"b"],
+            vec![b"PEXPIRE", b"h", b"500"],
+            vec![b"HSET", b"h", b"f", b"ttl"],
+            vec![b"LSET", b"l", b"90", b"bad"],
+            vec![b"ZINCRBY", b"z", b"nan", b"a"],
+        ];
+        for args in &commands {
+            let expected = reference.execute(args, 1000, |_| true);
+            let actual = live
+                .execute_collection_in_place(args, 1000, &mut sink)
+                .unwrap_or_else(|| live.execute(args, 1000, |m| sink.submit(m)));
+            assert_eq!(actual, expected, "{args:?}");
+            for key in [b"h", b"l", b"s", b"z"] {
+                assert_eq!(live.snapshot(key), reference.snapshot(key));
+                if let Some(entry) = live.snapshot(key) {
+                    assert_eq!(entry.value.len(), entry.value.as_ref().len());
+                    assert_eq!(
+                        entry.value.memory_bytes(),
+                        reference.snapshot(key).unwrap().value.memory_bytes()
+                    );
+                }
+            }
+        }
+        sink.capture(&live);
+        sink.flush().unwrap();
+        let committing = rx.recv().unwrap();
+        let before: Vec<_> = committing
+            .mutations
+            .iter()
+            .map(|m| m.entry.clone())
+            .collect();
+        for args in &commands {
+            live.execute_collection_in_place(args, 1000, &mut sink)
+                .unwrap_or_else(|| live.execute(args, 1000, |m| sink.submit(m)));
+        }
+        // Replacements, deletion and expiration must all cancel or capture the
+        // correct deferred state, including multi-key generic commands.
+        live.execute(&[b"MSET", b"h", b"plain", b"l", b"plain"], 1000, |m| {
+            sink.submit(m)
+        });
+        live.execute(&[b"DEL", b"z"], 1000, |m| sink.submit(m));
+        live.execute(&[b"PEXPIRE", b"s", b"1"], 1000, |m| sink.submit(m));
+        live.execute_collection_in_place(&[b"SADD", b"s", b"expires"], 1000, &mut sink);
+        live.reap(1002);
+        sink.capture(&live);
+        sink.flush().unwrap();
+        let latest = rx.recv().unwrap();
+        assert!(latest
+            .mutations
+            .iter()
+            .any(|m| m.key.as_ref() == b"s" && m.entry.is_none()));
+        assert_eq!(
+            before,
+            committing
+                .mutations
+                .iter()
+                .map(|m| m.entry.clone())
+                .collect::<Vec<_>>()
+        );
+        drop(committing);
+        drop(latest);
+        assert_eq!(sink.pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn deferred_admission_rejection_leaves_live_collection_unchanged() {
+        let mut live = Engine::new(1 << 20);
+        live.execute(&[b"HSET", b"h", b"f", b"old"], 1000, |_| true);
+        let before = live.snapshot(b"h");
+        let (mut sink, _rx) = channel_with_limit(0, false, 1);
+        let result = live
+            .execute_collection_in_place(&[b"HSET", b"h", b"f", b"new"], 1000, &mut sink)
+            .unwrap();
+        assert_eq!(
+            result,
+            Reply::Error("MISCONF persistence backlog full or unavailable")
+        );
+        assert_eq!(live.snapshot(b"h"), before);
+        assert_eq!(sink.accepted, 0);
+        assert_eq!(sink.pending.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn collection_staging_replaces_only_superseded_snapshots() {
@@ -628,8 +833,8 @@ mod tests {
         assert!(sink.submit(smallvec::smallvec![make(b"new")]));
         sink.flush().unwrap();
         let batch = rx.recv().unwrap();
-        assert_eq!(batch.mutations.len(), 3);
-        assert_eq!(batch.mutations[2].entry, make(b"new").entry);
+        assert_eq!(batch.mutations.len(), 1);
+        assert_eq!(batch.mutations[0].entry, make(b"new").entry);
     }
 
     #[test]
@@ -693,12 +898,12 @@ mod tests {
             key: b"a".as_slice().into(),
             entry: None
         }]));
-        sink.flush_if_due().unwrap();
+        sink.flush_if_due(&Engine::new(1024)).unwrap();
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         assert_eq!(sink.pending.load(Ordering::Relaxed), 129);
         sink.staged_since = Some(Instant::now() - HANDOFF_DELAY);
         assert!(sink.handoff_wait().is_zero());
-        sink.flush_if_due().unwrap();
+        sink.flush_if_due(&Engine::new(1024)).unwrap();
         let first = rx.try_recv().unwrap();
         assert_eq!(first.sequence, 1);
         assert!(sink.staged_since.is_none());
@@ -707,7 +912,7 @@ mod tests {
             key: vec![0; HANDOFF_BYTES].into(),
             entry: None
         }]));
-        sink.flush_if_due().unwrap();
+        sink.flush_if_due(&Engine::new(1024)).unwrap();
         let second = rx.try_recv().unwrap();
         assert_eq!(second.sequence, 2);
         drop(second);

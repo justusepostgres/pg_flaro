@@ -1,6 +1,7 @@
 //! Typed immutable values with a versioned binary representation for persistence.
 use crate::engine::Bytes;
-use im::{HashMap, HashSet, OrdSet, Vector};
+use im::{OrdSet, Vector};
+use std::collections::{HashMap, HashSet};
 // Reserve room for sparsely populated persistent-tree roots and vector chunks.
 pub(crate) const COLLECTION_BASE_MEMORY: usize = 8192;
 use std::{
@@ -35,7 +36,7 @@ impl SortedSet {
         self.order.insert((score, member));
     }
     pub fn remove(&mut self, member: &[u8]) -> bool {
-        if let Some((member, score)) = self.scores.remove_with_key(member) {
+        if let Some((member, score)) = self.scores.remove_entry(member) {
             self.order.remove(&(score, member));
             true
         } else {
@@ -310,7 +311,7 @@ impl Value {
                 }
                 Collection::List(v) => v.push_back(field()?),
                 Collection::Set(v) => {
-                    if v.insert(field()?).is_some() {
+                    if !v.insert(field()?) {
                         return Err("duplicate set member");
                     }
                 }

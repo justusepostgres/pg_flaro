@@ -11,7 +11,7 @@ unsafe extern "C" {
     ) -> f64;
 }
 static LOCALE: OnceLock<usize> = OnceLock::new();
-pub(super) fn parse(bytes: &[u8]) -> Result<f64> {
+pub(crate) fn parse(bytes: &[u8]) -> Result<f64> {
     let invalid = || Reply::Error("ERR value is not a valid float");
     if bytes.is_empty() || bytes[0].is_ascii_whitespace() {
         return Err(invalid());

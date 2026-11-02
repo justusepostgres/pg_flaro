@@ -108,6 +108,9 @@ def main():
     p.add_argument("--threads", type=int, default=2)
     p.add_argument("--seconds", type=float, default=3)
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument(
+        "--revision", help="Source revision used to build the supplied library"
+    )
     p.add_argument("--restart-check", action="store_true")
     a = p.parse_args()
     bindir = Path(
@@ -133,11 +136,14 @@ def main():
         ).strip(),
         "library_sha256": hashlib.sha256(a.library.read_bytes()).hexdigest(),
         "driver_sha256": hashlib.sha256(a.driver.read_bytes()).hexdigest(),
-        "source_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip()
-        if (ROOT / ".git").exists()
-        else "archive",
+        "source_revision": a.revision
+        or (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ).strip()
+            if (ROOT / ".git").exists()
+            else "archive"
+        ),
         "settings": {
             "flaro": "journal write-behind, WAL logged, flush_ms=100, pending=128MiB, memory=512MiB",
             "redis": "AOF off, RDB off, maxmemory=512MiB, noeviction",

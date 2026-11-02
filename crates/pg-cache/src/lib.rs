@@ -262,6 +262,8 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
     let address = std::net::SocketAddr::new(ip, PORT.get() as u16);
     // Inherit a blocked signal mask in the Rust thread. PostgreSQL's asynchronous
     // signal handlers must run on the worker's main thread, never the network thread.
+    let mut sink = sink;
+    sink.set_collection_delay(Duration::from_millis(FLUSH_MS.get() as u64));
     let pending_limit = sink.pending_limit();
     let network = unsafe {
         let mut blocked: libc::sigset_t = std::mem::zeroed();

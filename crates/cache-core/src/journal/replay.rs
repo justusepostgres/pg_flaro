@@ -88,7 +88,7 @@ mod tests {
         let state = State::default().append(1, 313, 1 << 20).unwrap();
         let mut replay = Replay::new(state, 1 << 20).unwrap();
         let restored = replay
-            .push(0, 0, 1, &encode(&[mutation.clone()]).unwrap())
+            .push(0, 0, 1, &encode(std::slice::from_ref(&mutation)).unwrap())
             .unwrap();
         assert_eq!(restored[0].entry, mutation.entry);
         replay.finish().unwrap();
