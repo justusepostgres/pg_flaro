@@ -19,3 +19,8 @@ __pycache__/
 !/scripts/integration.py
 !/scripts/installed_integration.py
 !/scripts/redis_client_integration.py
+
+!/scripts/cluster_integration.py
+!/scripts/reshard.py
+
+!/scripts/collections_integration.py

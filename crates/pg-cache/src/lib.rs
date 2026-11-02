@@ -1,3 +1,4 @@
+mod cluster_store;
 mod heap;
 #[cfg(feature = "journal-prototype")]
 mod journal_copy;
@@ -32,6 +33,8 @@ static JOURNAL_PENDING_MB: GucSetting<i32> = GucSetting::<i32>::new(16);
 #[cfg(feature = "journal-prototype")]
 static JOURNAL: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+static CLUSTER_CONFIG: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
 static DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"postgres"));
 static LISTEN_ADDRESS: GucSetting<Option<CString>> =
@@ -42,6 +45,14 @@ static FLUSH_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        c"pg_cache.cluster_config",
+        c"Redis Cluster bootstrap JSON",
+        c"Requires restart; persisted slot ownership takes precedence",
+        &CLUSTER_CONFIG,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
     #[cfg(feature = "journal-prototype")]
     GucRegistry::define_int_guc(
         c"pg_cache.journal_pending_mb",
@@ -134,9 +145,15 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
     // CREATE EXTENSION can be issued after preload; do not open the Redis port until schema exists.
     loop {
         let ready = BackgroundWorker::transaction(|| {
+            if Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+                .unwrap()
+                .unwrap()
+            {
+                return false;
+            }
             #[cfg(feature = "journal-prototype")]
             if JOURNAL.get() {
-                return journal_worker::ready();
+                return journal_worker::schema_ready();
             }
             Spi::get_one::<bool>("SELECT to_regclass('cache_store.checkpoint') IS NOT NULL")
                 .unwrap()
@@ -149,6 +166,7 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
             return;
         }
     }
+    BackgroundWorker::transaction(storage::ensure_value_types);
     let (engine, sequence) = BackgroundWorker::transaction(|| {
         #[cfg(feature = "journal-prototype")]
         if JOURNAL.get() {
@@ -161,7 +179,7 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
         let now = now_ms();
         Spi::connect(|client| {
             let mut cursor = client.open_cursor(
-                "SELECT key,value,expires_at_ms FROM cache_store.entries",
+                "SELECT key,value,expires_at_ms,data_type FROM cache_store.entries",
                 &[],
             );
             loop {
@@ -174,7 +192,15 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
                         .restore(
                             row.get::<Vec<u8>>(1).unwrap().unwrap(),
                             Entry {
-                                value: row.get::<Vec<u8>>(2).unwrap().unwrap().into(),
+                                value: pg_cache_core::value::Value::from_stored(
+                                    row.get::<i16>(4)
+                                        .unwrap()
+                                        .unwrap()
+                                        .try_into()
+                                        .expect("value type"),
+                                    &row.get::<Vec<u8>>(2).unwrap().unwrap(),
+                                )
+                                .expect("decode stored value"),
                                 expires_at_ms: row.get::<i64>(3).unwrap(),
                             },
                             now,
@@ -201,6 +227,28 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
     );
     #[cfg(not(feature = "journal-prototype"))]
     let (sink, rx) = server::channel(sequence);
+    if CLUSTER_CONFIG.get().is_none() {
+        let has_cluster_state = BackgroundWorker::transaction(|| {
+            Spi::get_one::<bool>("SELECT to_regclass('cache_store.cluster_state') IS NOT NULL")
+                .unwrap()
+                .unwrap()
+        });
+        assert!(
+            !has_cluster_state,
+            "pg_cache.cluster_config is required for a database with persisted cluster state"
+        );
+    }
+    let (cluster_tx, cluster_rx) = std::sync::mpsc::sync_channel(1);
+    let cluster = CLUSTER_CONFIG.get().map(|json| {
+        let config =
+            pg_cache_core::cluster::Config::parse(json.to_str().expect("cluster config UTF8"))
+                .expect("invalid cluster config");
+        let topology = cluster_store::load(config);
+        engine
+            .validate_cluster_ownership(&topology)
+            .expect("dataset does not match cluster slot ownership");
+        pg_cache_core::cluster::Cluster::new(topology, cluster_tx)
+    });
     let committed = sink.committed.clone();
     let metrics = sink.metrics.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -227,7 +275,7 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
         );
         let result = std::thread::Builder::new()
             .name("pg-cache-resp".into())
-            .spawn(move || server::serve(address, engine, sink, network_stop));
+            .spawn(move || server::serve_cluster(address, engine, sink, network_stop, cluster));
         assert_eq!(
             libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()),
             0
@@ -243,6 +291,9 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
     while BackgroundWorker::wait_latch(Some(Duration::ZERO)) {
         if network.is_finished() {
             break;
+        }
+        if let Ok(request) = cluster_rx.try_recv() {
+            cluster_store::save(request);
         }
         // The channel wakes the writer immediately under load. Waiting only on a
         // PostgreSQL latch until flush_ms would impose an artificial queue/interval
@@ -287,6 +338,25 @@ pub extern "C-unwind" fn pg_cache_main(_arg: pg_sys::Datum) {
         }
     }
     stop.store(true, Ordering::Release);
+    // An in-flight migration may be waiting for this thread to commit its
+    // import/deletion or metadata. Keep servicing those barriers until the
+    // network thread observes stop; joining first would deadlock clean shutdown.
+    while !network.is_finished() {
+        if let Ok(request) = cluster_rx.try_recv() {
+            cluster_store::save(request);
+        }
+        if let Ok(batch) = rx.recv_timeout(Duration::from_millis(10)) {
+            writes.push(batch);
+        }
+        for batch in rx.try_iter().take(1024) {
+            writes.push(batch);
+        }
+        store.persist(&writes, &metrics);
+        if let Some(sequence) = writes.sequence() {
+            committed.store(sequence, Ordering::Release);
+        }
+        writes.clear();
+    }
     network
         .join()
         .expect("network thread panic")

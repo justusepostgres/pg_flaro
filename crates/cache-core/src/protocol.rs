@@ -1,5 +1,8 @@
 //! Bounded, binary-safe RESP2 command framing. Incomplete input is not an error.
 pub const MAX_FRAME: usize = 1024 * 1024;
+// Administrative transfer envelopes add IDs, endpoint and absolute TTL fields
+// around a key/value that already fits the ordinary 1-MiB request bound.
+pub const MAX_TRANSFER_FRAME: usize = MAX_FRAME + 512;
 const MAX_ARGS: usize = 1024;
 pub type Command<'a> = smallvec::SmallVec<[&'a [u8]; 8]>;
 pub type Parsed<'a> = Result<Option<(Command<'a>, usize)>, &'static str>;
@@ -59,7 +62,14 @@ pub fn parse(buf: &[u8]) -> Parsed<'_> {
             .checked_add(len)
             .and_then(|v| v.checked_add(2))
             .ok_or("frame too large")?;
-        if end > MAX_FRAME {
+        let limit = if args.first().is_some_and(|name: &&[u8]| {
+            name.eq_ignore_ascii_case(b"PGCACHE.IMPORT") || name.eq_ignore_ascii_case(b"MIGRATE")
+        }) {
+            MAX_TRANSFER_FRAME
+        } else {
+            MAX_FRAME
+        };
+        if end > limit {
             return Err("frame too large");
         }
         if end > buf.len() {
@@ -78,6 +88,7 @@ pub fn parse(buf: &[u8]) -> Parsed<'_> {
 pub enum Reply {
     Simple(&'static str),
     Error(&'static str),
+    OwnedError(String),
     Integer(i64),
     Bulk(Option<Vec<u8>>),
     Array(Vec<Reply>),
@@ -105,6 +116,11 @@ impl Reply {
                 out.extend_from_slice(s.as_bytes());
                 out.extend_from_slice(b"\r\n");
             }
+            Self::OwnedError(s) => {
+                out.push(b'-');
+                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
             Self::Integer(n) => {
                 out.push(b':');
                 out.extend_from_slice(itoa::Buffer::new().format(*n).as_bytes());
@@ -126,6 +142,19 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transfer_envelope_reserve_is_not_available_to_data_commands() {
+        let payload = vec![b'x'; MAX_FRAME - 10];
+        let mut frame = b"*2\r\n".to_vec();
+        bulk(Some(b"PGCACHE.IMPORT"), &mut frame);
+        bulk(Some(&payload), &mut frame);
+        assert!(frame.len() > MAX_FRAME && frame.len() <= MAX_TRANSFER_FRAME);
+        assert!(parse(&frame).unwrap().is_some());
+        let mut ordinary = b"*2\r\n".to_vec();
+        bulk(Some(b"ECHO"), &mut ordinary);
+        bulk(Some(&payload), &mut ordinary);
+        assert!(parse(&ordinary).is_err());
+    }
     #[test]
     fn fragmented_binary_pipeline() {
         let frame = b"*2\r\n$4\r\nECHO\r\n$4\r\n\0\r\nx\r\n";

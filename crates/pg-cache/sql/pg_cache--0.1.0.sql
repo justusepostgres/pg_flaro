@@ -3,7 +3,8 @@ REVOKE ALL ON SCHEMA cache_store FROM PUBLIC;
 CREATE TABLE cache_store.entries (
     key bytea NOT NULL,
     value bytea NOT NULL,
-    expires_at_ms bigint
+    expires_at_ms bigint,
+    data_type smallint NOT NULL DEFAULT 0
 );
 -- Hash scans recheck the full bytea key and support keys larger than a B-tree
 -- index tuple. The private writer serializes MERGE with a table write lock.

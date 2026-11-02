@@ -621,7 +621,10 @@ name = "pg-cache-core"
 version = "0.1.0"
 dependencies = [
  "itoa",
+ "libc",
  "polling",
+ "serde",
+ "serde_json",
  "smallvec",
 ]
 

@@ -1,0 +1,190 @@
+# Experimental three-shard example for CNPG 1.30.1, all in one namespace.
+# Replace the image with a fresh build containing cluster support.
+# Two instances per shard; synchronous commits require its standby.
+# No resources are installed by this example until explicitly applied.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: flaro-a
+spec:
+  instances: 2
+  imageName: REGISTRY/pg-cache:cluster-build
+  bootstrap:
+    initdb:
+      database: cache
+      owner: cache_owner
+      postInitApplicationSQL:
+        - CREATE EXTENSION pg_cache
+        - CREATE EXTENSION pg_cache_journal
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+    shared_preload_libraries: [pg_cache]
+    parameters:
+      pg_cache.cluster_config: '{"local_id":"1111111111111111111111111111111111111111","nodes":[{"id":"1111111111111111111111111111111111111111","host":"flaro-a-redis","port":6380,"slots":[[0,5460]]},{"id":"2222222222222222222222222222222222222222","host":"flaro-b-redis","port":6380,"slots":[[5461,10922]]},{"id":"3333333333333333333333333333333333333333","host":"flaro-c-redis","port":6380,"slots":[[10923,16383]]}]}'
+      pg_cache.database: cache
+      pg_cache.listen_address: 0.0.0.0
+      pg_cache.port: '6380'
+      pg_cache.journal: 'on'
+      pg_cache.journal_pending_mb: '128'
+      pg_cache.memory_mb: '512'
+      pg_cache.flush_ms: '25'
+  resources:
+    requests:
+      cpu: '1'
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  storage:
+    size: 10Gi
+  managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: flaro-a-redis
+            spec:
+              type: ClusterIP
+              ports:
+                - name: redis
+                  protocol: TCP
+                  port: 6380
+                  targetPort: 6380
+
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: flaro-b
+spec:
+  instances: 2
+  imageName: REGISTRY/pg-cache:cluster-build
+  bootstrap:
+    initdb:
+      database: cache
+      owner: cache_owner
+      postInitApplicationSQL:
+        - CREATE EXTENSION pg_cache
+        - CREATE EXTENSION pg_cache_journal
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+    shared_preload_libraries: [pg_cache]
+    parameters:
+      pg_cache.cluster_config: '{"local_id":"2222222222222222222222222222222222222222","nodes":[{"id":"1111111111111111111111111111111111111111","host":"flaro-a-redis","port":6380,"slots":[[0,5460]]},{"id":"2222222222222222222222222222222222222222","host":"flaro-b-redis","port":6380,"slots":[[5461,10922]]},{"id":"3333333333333333333333333333333333333333","host":"flaro-c-redis","port":6380,"slots":[[10923,16383]]}]}'
+      pg_cache.database: cache
+      pg_cache.listen_address: 0.0.0.0
+      pg_cache.port: '6380'
+      pg_cache.journal: 'on'
+      pg_cache.journal_pending_mb: '128'
+      pg_cache.memory_mb: '512'
+      pg_cache.flush_ms: '25'
+  resources:
+    requests:
+      cpu: '1'
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  storage:
+    size: 10Gi
+  managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: flaro-b-redis
+            spec:
+              type: ClusterIP
+              ports:
+                - name: redis
+                  protocol: TCP
+                  port: 6380
+                  targetPort: 6380
+
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: flaro-c
+spec:
+  instances: 2
+  imageName: REGISTRY/pg-cache:cluster-build
+  bootstrap:
+    initdb:
+      database: cache
+      owner: cache_owner
+      postInitApplicationSQL:
+        - CREATE EXTENSION pg_cache
+        - CREATE EXTENSION pg_cache_journal
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+    shared_preload_libraries: [pg_cache]
+    parameters:
+      pg_cache.cluster_config: '{"local_id":"3333333333333333333333333333333333333333","nodes":[{"id":"1111111111111111111111111111111111111111","host":"flaro-a-redis","port":6380,"slots":[[0,5460]]},{"id":"2222222222222222222222222222222222222222","host":"flaro-b-redis","port":6380,"slots":[[5461,10922]]},{"id":"3333333333333333333333333333333333333333","host":"flaro-c-redis","port":6380,"slots":[[10923,16383]]}]}'
+      pg_cache.database: cache
+      pg_cache.listen_address: 0.0.0.0
+      pg_cache.port: '6380'
+      pg_cache.journal: 'on'
+      pg_cache.journal_pending_mb: '128'
+      pg_cache.memory_mb: '512'
+      pg_cache.flush_ms: '25'
+  resources:
+    requests:
+      cpu: '1'
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+  storage:
+    size: 10Gi
+  managed:
+    services:
+      additional:
+        - selectorType: rw
+          serviceTemplate:
+            metadata:
+              name: flaro-c-redis
+            spec:
+              type: ClusterIP
+              ports:
+                - name: redis
+                  protocol: TCP
+                  port: 6380
+                  targetPort: 6380
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flaro-private-redis
+spec:
+  podSelector:
+    matchExpressions:
+      - key: cnpg.io/cluster
+        operator: In
+        values: [flaro-a, flaro-b, flaro-c]
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 5432}
+        - {protocol: TCP, port: 8000}
+        - {protocol: TCP, port: 9187}
+    - from:
+        - podSelector:
+            matchLabels:
+              pg-cache-client: 'true'
+        - podSelector:
+            matchExpressions:
+              - key: cnpg.io/cluster
+                operator: In
+                values: [flaro-a, flaro-b, flaro-c]
+      ports:
+        - {protocol: TCP, port: 6380}

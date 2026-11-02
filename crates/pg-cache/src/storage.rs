@@ -4,6 +4,25 @@ use pg_cache_core::{engine::Bytes, metrics::PersistenceMetrics, server::PendingW
 use pgrx::{bgworkers::BackgroundWorker, prelude::*};
 use std::collections::HashMap;
 
+/// Upgrade old string-only tables without rewriting or interpreting their bytes.
+/// Called once by the main worker before restore/listen; compaction waits for it.
+pub(crate) fn ensure_value_types() {
+    Spi::run("SET LOCAL synchronous_commit=on").unwrap();
+    for table in ["cache_store.entries", "cache_journal.entries"] {
+        let exists = Spi::get_one_with_args::<bool>("SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass($1) AND attname='data_type' AND NOT attisdropped)", &[table.into()]).unwrap().unwrap();
+        if !exists
+            && Spi::get_one_with_args::<bool>("SELECT to_regclass($1) IS NOT NULL", &[table.into()])
+                .unwrap()
+                .unwrap()
+        {
+            Spi::run(&format!(
+                "ALTER TABLE {table} ADD COLUMN data_type smallint NOT NULL DEFAULT 0"
+            ))
+            .expect("upgrade value types");
+        }
+    }
+}
+
 const MAX_HINT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
@@ -45,6 +64,7 @@ impl Store {
         let started = std::time::Instant::now();
         let mut keys = Vec::new();
         let mut values = Vec::new();
+        let mut types = Vec::new();
         let mut expirations = Vec::new();
         let mut locations = Vec::new();
         let mut deletes = Vec::new();
@@ -53,6 +73,7 @@ impl Store {
                 Some(entry) => {
                     keys.push(&mutation.key);
                     values.push(entry.value.as_ref());
+                    types.push(entry.value.kind() as i16);
                     expirations.push(entry.expires_at_ms);
                     locations.push(self.locations.get(&mutation.key).copied());
                 }
@@ -72,21 +93,27 @@ impl Store {
                 .expect("serialize cache writes");
             let mut updated = vec![false; keys.len()];
             if locations.iter().any(Option::is_some) {
-                for (index, tid) in
-                    super::heap::update_existing(&key_bytes, &values, &expirations, &locations)
-                {
+                for (index, tid) in super::heap::update_existing(
+                    &key_bytes,
+                    &values,
+                    &expirations,
+                    &types,
+                    &locations,
+                ) {
                     updated[index] = true;
                     learned.push((keys[index].clone(), tid));
                 }
             }
             let mut missing_keys = Vec::new();
             let mut missing_values = Vec::new();
+            let mut missing_types = Vec::new();
             let mut missing_expirations = Vec::new();
             for (index, was_updated) in updated.iter().enumerate() {
                 if !was_updated {
                     missing_keys.push(key_bytes[index]);
                     missing_values.push(values[index]);
                     missing_expirations.push(expirations[index]);
+                    missing_types.push(types[index]);
                 }
             }
             if !missing_keys.is_empty() {
@@ -95,8 +122,8 @@ impl Store {
                         // A SELECT around MERGE RETURNING avoids SPI status19,
                         // which pgrx0.16.1 does not yet recognize.
                         let rows = client.update(
-                        "WITH changed AS (MERGE INTO cache_store.entries AS target USING (SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[])) AS source(key,value,expires_at_ms) ON target.key=source.key WHEN MATCHED THEN UPDATE SET value=source.value,expires_at_ms=source.expires_at_ms WHEN NOT MATCHED THEN INSERT(key,value,expires_at_ms) VALUES(source.key,source.value,source.expires_at_ms) RETURNING target.key,target.ctid) SELECT key,ctid FROM changed",
-                        None, &[missing_keys.into(), missing_values.into(), missing_expirations.into()],
+                        "WITH changed AS (MERGE INTO cache_store.entries AS target USING (SELECT * FROM unnest($1::bytea[], $2::bytea[], $3::bigint[], $4::smallint[])) AS source(key,value,expires_at_ms,data_type) ON target.key=source.key WHEN MATCHED THEN UPDATE SET value=source.value,expires_at_ms=source.expires_at_ms,data_type=source.data_type WHEN NOT MATCHED THEN INSERT(key,value,expires_at_ms,data_type) VALUES(source.key,source.value,source.expires_at_ms,source.data_type) RETURNING target.key,target.ctid) SELECT key,ctid FROM changed",
+                        None, &[missing_keys.into(), missing_values.into(), missing_expirations.into(), missing_types.into()],
                     ).expect("persist missing tuple hints");
                         for row in rows {
                             learned.push((

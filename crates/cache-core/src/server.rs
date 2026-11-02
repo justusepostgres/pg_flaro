@@ -70,7 +70,7 @@ pub fn channel_with_limit(
     )
 }
 impl Sink {
-    fn submit(&mut self, mutations: Mutations) -> bool {
+    pub(crate) fn submit(&mut self, mutations: Mutations) -> bool {
         let bytes = mutations.iter().map(Mutation::bytes).sum();
         let Some(sequence) = self
             .accepted
@@ -95,6 +95,19 @@ impl Sink {
         self.staged_bytes += bytes;
         self.accepted = sequence;
         true
+    }
+    pub(crate) fn barrier(&mut self) -> io::Result<()> {
+        self.flush()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.committed.load(Ordering::Acquire) < self.accepted {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "persistence barrier timed out; restart required",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
         if self.staged.is_empty() {
@@ -204,14 +217,66 @@ struct Client {
     closing: bool,
     writable: bool,
     readable: bool,
+    asking: bool,
 }
 impl Client {
-    fn commands(&mut self, engine: &mut Engine, sink: &mut Sink) -> io::Result<bool> {
+    fn commands(
+        &mut self,
+        engine: &mut Engine,
+        sink: &mut Sink,
+        cluster: &mut Option<crate::cluster::Cluster>,
+    ) -> io::Result<bool> {
         let mut consumed = 0;
         let mut blocked = false;
         loop {
             match protocol::parse(&self.input[consumed..]) {
                 Ok(Some((args, n))) => {
+                    if cluster.is_none() && args.len() == 2 && args[0].eq_ignore_ascii_case(b"GET")
+                    {
+                        engine.get_into(args[1], now_ms(), &mut self.output);
+                        consumed += n;
+                        if self.output.len() > MAX_OUTPUT {
+                            return Err(io::Error::other("slow client output limit"));
+                        }
+                        continue;
+                    }
+                    let asking = self.asking;
+                    // ASKING authorizes exactly one command, including a pipelined one.
+                    self.asking = false;
+                    let special = if args[0].eq_ignore_ascii_case(b"ASKING") && args.len() == 1 {
+                        if cluster.is_some() {
+                            self.asking = true;
+                            Some(Reply::Simple("OK"))
+                        } else {
+                            Some(Reply::Error("ERR cluster support disabled"))
+                        }
+                    } else if args[0].eq_ignore_ascii_case(b"COMMAND") {
+                        Some(crate::cluster::command(&args))
+                    } else if let Some(cluster) = cluster {
+                        cluster
+                            .execute(&args, engine, sink)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                            .or_else(|| cluster.route(&args, asking, engine, now_ms()))
+                    } else if args[0].eq_ignore_ascii_case(b"CLUSTER") {
+                        Some(Reply::Error("ERR cluster support disabled"))
+                    } else {
+                        None
+                    };
+                    if let Some(reply) = special {
+                        if reply == Reply::Error("MISCONF persistence backlog full or unavailable")
+                            && sink.accepted < i64::MAX as u64
+                        {
+                            self.asking = asking;
+                            blocked = true;
+                            break;
+                        }
+                        reply.encode(&mut self.output);
+                        consumed += n;
+                        if self.output.len() > MAX_OUTPUT {
+                            return Err(io::Error::other("slow client output limit"));
+                        }
+                        continue;
+                    }
                     if args.len() == 2 && args[0].eq_ignore_ascii_case(b"GET") {
                         engine.get_into(args[1], now_ms(), &mut self.output);
                         consumed += n;
@@ -247,6 +312,7 @@ impl Client {
                         // read interest is disabled while it is deferred. Other
                         // connections can still read. Sequence exhaustion is
                         // permanent and must return an error instead of waiting.
+                        self.asking = asking;
                         blocked = true;
                         break;
                     }
@@ -270,14 +336,19 @@ impl Client {
         self.input.drain(..consumed);
         Ok(blocked)
     }
-    fn read(&mut self, engine: &mut Engine, sink: &mut Sink) -> io::Result<bool> {
+    fn read(
+        &mut self,
+        engine: &mut Engine,
+        sink: &mut Sink,
+        cluster: &mut Option<crate::cluster::Cluster>,
+    ) -> io::Result<bool> {
         let mut chunk = [0u8; 8192];
         let mut budget: usize = 64 * 1024;
         loop {
-            if self.commands(engine, sink)? {
+            if self.commands(engine, sink, cluster)? {
                 return Ok(true);
             }
-            if self.input.len() > protocol::MAX_FRAME {
+            if self.input.len() > protocol::MAX_TRANSFER_FRAME {
                 return Err(io::Error::other("input limit"));
             }
             if self.closing {
@@ -300,8 +371,8 @@ impl Client {
                     budget = budget.saturating_sub(n);
                     if n < chunk.len() {
                         // Level readiness reports unread or newly arriving bytes.
-                        let blocked = self.commands(engine, sink)?;
-                        if self.input.len() > protocol::MAX_FRAME {
+                        let blocked = self.commands(engine, sink, cluster)?;
+                        if self.input.len() > protocol::MAX_TRANSFER_FRAME {
                             return Err(io::Error::other("input limit"));
                         }
                         return Ok(blocked);
@@ -338,9 +409,18 @@ impl Client {
 
 pub fn serve(
     address: SocketAddr,
+    engine: Engine,
+    sink: Sink,
+    stop: Arc<AtomicBool>,
+) -> io::Result<()> {
+    serve_cluster(address, engine, sink, stop, None)
+}
+pub fn serve_cluster(
+    address: SocketAddr,
     mut engine: Engine,
     mut sink: Sink,
     stop: Arc<AtomicBool>,
+    mut cluster: Option<crate::cluster::Cluster>,
 ) -> io::Result<()> {
     #[cfg(feature = "io-diagnostics")]
     let _diagnostics = crate::io_diagnostics::Session::start();
@@ -397,6 +477,7 @@ pub fn serve(
                                     closing: false,
                                     writable: false,
                                     readable: true,
+                                    asking: false,
                                 },
                             );
                         }
@@ -411,10 +492,16 @@ pub fn serve(
                 continue;
             };
             let read_result = if readable && !client.closing {
-                client.read(&mut engine, &mut sink)
+                client.read(&mut engine, &mut sink, &mut cluster)
             } else {
                 Ok(false)
             };
+            if read_result
+                .as_ref()
+                .is_err_and(|e| e.kind() == io::ErrorKind::InvalidData)
+            {
+                return read_result.map(|_| ());
+            }
             serviced.push((token, read_result));
         }
         // Small writes share a bounded staging window to avoid waking the

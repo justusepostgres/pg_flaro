@@ -18,15 +18,16 @@ unsafe fn compatible(relation: pg_sys::Relation, indexes: pg_sys::CatalogIndexSt
         || class.relhassubclass
         || class.relispartition
         || class.relchecks != 0
-        || desc.natts != 3
+        || desc.natts != 4
         || (*indexes).ri_NumIndices != 1
     {
         return false;
     }
-    for (attr, (name, oid, not_null)) in desc.attrs.as_slice(3).iter().zip([
+    for (attr, (name, oid, not_null)) in desc.attrs.as_slice(4).iter().zip([
         (c"key", pg_sys::BYTEAOID, true),
         (c"value", pg_sys::BYTEAOID, true),
         (c"expires_at_ms", pg_sys::INT8OID, false),
+        (c"data_type", pg_sys::INT2OID, true),
     ]) {
         if attr.atttypid != oid
             || attr.attnotnull != not_null
@@ -62,9 +63,11 @@ pub fn update_existing(
     keys: &[&[u8]],
     values: &[&[u8]],
     expirations: &[Option<i64>],
+    types: &[i16],
     locations: &[Option<pg_sys::ItemPointerData>],
 ) -> Vec<(usize, pg_sys::ItemPointerData)> {
     assert_eq!(keys.len(), values.len());
+    assert_eq!(keys.len(), types.len());
     assert_eq!(keys.len(), expirations.len());
     assert_eq!(keys.len(), locations.len());
     Spi::run("LOCK TABLE cache_store.entries IN SHARE ROW EXCLUSIVE MODE")
@@ -121,8 +124,9 @@ pub fn update_existing(
                     expirations[index]
                         .into_datum()
                         .unwrap_or(pg_sys::Datum::from(0usize)),
+                    types[index].into_datum().unwrap(),
                 ];
-                let mut nulls = [false, false, expirations[index].is_none()];
+                let mut nulls = [false, false, expirations[index].is_none(), false];
                 let new = pg_sys::heap_form_tuple(desc, datums.as_mut_ptr(), nulls.as_mut_ptr());
                 pg_sys::CatalogTupleUpdateWithInfo(relation, &mut old.t_self, new, indexes);
                 changed.push((index, (*new).t_self));

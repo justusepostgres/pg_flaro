@@ -13,8 +13,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) fn ready() -> bool {
+pub(crate) fn schema_ready() -> bool {
     Spi::get_one::<bool>("SELECT to_regclass('cache_journal.state') IS NOT NULL AND to_regclass('cache_journal.entries') IS NOT NULL AND to_regclass('cache_journal.segment0') IS NOT NULL AND to_regclass('cache_journal.segment1') IS NOT NULL").unwrap().unwrap()
+}
+
+fn ready() -> bool {
+    schema_ready() && Spi::get_one::<bool>("SELECT NOT pg_is_in_recovery() AND EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass('cache_journal.entries') AND attname='data_type' AND NOT attisdropped)").unwrap().unwrap()
 }
 
 pub(crate) fn persist(writes: &PendingWrites, metrics: &PersistenceMetrics) {

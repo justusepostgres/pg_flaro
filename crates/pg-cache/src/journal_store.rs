@@ -260,19 +260,20 @@ fn apply_batch(batch: &[(&Bytes, &Option<Entry>)]) {
     // Construct PostgreSQL parameter datums inside this SPI context so they are
     // released after each bounded statement group, rather than at transaction end.
     Spi::connect_mut(|client| {
-        let (mut keys, mut values, mut expirations, mut deletes) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut keys, mut values, mut expirations, mut deletes, mut types) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (key, entry) in batch {
             if let Some(entry) = entry {
                 keys.push(key.as_ref());
                 values.push(entry.value.as_ref());
+                types.push(entry.value.kind() as i16);
                 expirations.push(entry.expires_at_ms);
             } else {
                 deletes.push(key.as_ref());
             }
         }
         if !keys.is_empty() {
-            client.update("MERGE INTO cache_journal.entries AS target USING (SELECT * FROM unnest($1::bytea[],$2::bytea[],$3::bigint[])) AS source(key,value,expires_at_ms) ON target.key=source.key WHEN MATCHED THEN UPDATE SET value=source.value,expires_at_ms=source.expires_at_ms WHEN NOT MATCHED THEN INSERT(key,value,expires_at_ms) VALUES(source.key,source.value,source.expires_at_ms)", None, &[keys.into(),values.into(),expirations.into()]).expect("materialize journal values");
+            client.update("MERGE INTO cache_journal.entries AS target USING (SELECT * FROM unnest($1::bytea[],$2::bytea[],$3::bigint[],$4::smallint[])) AS source(key,value,expires_at_ms,data_type) ON target.key=source.key WHEN MATCHED THEN UPDATE SET value=source.value,expires_at_ms=source.expires_at_ms,data_type=source.data_type WHEN NOT MATCHED THEN INSERT(key,value,expires_at_ms,data_type) VALUES(source.key,source.value,source.expires_at_ms,source.data_type)", None, &[keys.into(),values.into(),expirations.into(),types.into()]).expect("materialize journal values");
         }
         if !deletes.is_empty() {
             client
@@ -340,13 +341,21 @@ fn journal_proto_get(key: Vec<u8>) -> Option<Vec<u8>> {
         Spi::connect(|client| {
             let rows = client
                 .select(
-                    "SELECT value,expires_at_ms FROM cache_journal.entries WHERE key=$1",
+                    "SELECT value,expires_at_ms,data_type FROM cache_journal.entries WHERE key=$1",
                     None,
                     &[key.as_slice().into()],
                 )
                 .unwrap();
             rows.into_iter().next().map(|row| Entry {
-                value: row.get::<Vec<u8>>(1).unwrap().unwrap().into(),
+                value: pg_cache_core::value::Value::from_stored(
+                    row.get::<i16>(3)
+                        .unwrap()
+                        .unwrap()
+                        .try_into()
+                        .expect("value type"),
+                    &row.get::<Vec<u8>>(1).unwrap().unwrap(),
+                )
+                .expect("decode stored value"),
                 expires_at_ms: row.get::<i64>(2).unwrap(),
             })
         })
@@ -372,7 +381,7 @@ pub(crate) fn restore(
     let now = now_ms();
     Spi::connect(|client| {
         let mut cursor = client.open_cursor(
-            "SELECT key,value,expires_at_ms FROM cache_journal.entries",
+            "SELECT key,value,expires_at_ms,data_type FROM cache_journal.entries",
             &[],
         );
         loop {
@@ -389,7 +398,15 @@ pub(crate) fn restore(
                     .restore(
                         key,
                         Entry {
-                            value: row.get::<Vec<u8>>(2).unwrap().unwrap().into(),
+                            value: pg_cache_core::value::Value::from_stored(
+                                row.get::<i16>(4)
+                                    .unwrap()
+                                    .unwrap()
+                                    .try_into()
+                                    .expect("value type"),
+                                &row.get::<Vec<u8>>(2).unwrap().unwrap(),
+                            )
+                            .expect("decode stored value"),
                             expires_at_ms: row.get::<i64>(3).unwrap(),
                         },
                         now,

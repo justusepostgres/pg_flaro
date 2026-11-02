@@ -1,3 +1,5 @@
+pub mod cluster;
+mod collections;
 pub mod engine;
 mod handoff;
 #[cfg(feature = "io-diagnostics")]
@@ -7,6 +9,7 @@ pub mod metrics;
 mod persistence;
 pub mod protocol;
 pub mod server;
+pub mod value;
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()

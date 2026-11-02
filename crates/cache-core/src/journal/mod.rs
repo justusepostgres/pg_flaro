@@ -37,7 +37,9 @@ pub fn encode(mutations: &[Mutation]) -> Result<Vec<u8>, &'static str> {
     for m in mutations {
         let value = m.entry.as_ref().map_or(&[][..], |e| e.value.as_ref());
         let expiry = m.entry.as_ref().and_then(|e| e.expires_at_ms);
-        let flags = u8::from(m.entry.is_some()) | (u8::from(expiry.is_some()) << 1);
+        let flags = u8::from(m.entry.is_some())
+            | (u8::from(expiry.is_some()) << 1)
+            | (m.entry.as_ref().map_or(0, |e| e.value.kind()) << 2);
         out.push(flags);
         out.extend_from_slice(&(m.key.len() as u32).to_le_bytes());
         out.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -67,9 +69,12 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Mutation>, &'static str> {
         let key_len = u32::from_le_bytes(h[1..5].try_into().unwrap()) as usize;
         let value_len = u32::from_le_bytes(h[5..9].try_into().unwrap()) as usize;
         let expiry = i64::from_le_bytes(h[9..17].try_into().unwrap());
-        if !matches!(flags, 0 | 1 | 3)
-            || (flags == 0 && value_len != 0)
-            || (flags != 3 && expiry != 0)
+        let kind = flags >> 2;
+        let base = flags & 3;
+        if kind > 4
+            || !matches!(base, 0 | 1 | 3)
+            || (base == 0 && (value_len != 0 || kind != 0))
+            || (base != 3 && expiry != 0)
         {
             return Err("invalid journal flags");
         }
@@ -82,25 +87,24 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Mutation>, &'static str> {
         let value = bytes
             .get(key_end..value_end)
             .ok_or("truncated journal value")?;
+        let mutation = Mutation {
+            key: key.into(),
+            entry: if base == 0 {
+                None
+            } else {
+                Some(Entry {
+                    value: crate::value::Value::from_stored(kind, value)?,
+                    expires_at_ms: (base == 3).then_some(expiry),
+                })
+            },
+        };
         accounted = accounted
-            .checked_add(key_len)
-            .and_then(|n| n.checked_add(value_len))
-            .and_then(|n| n.checked_add(128))
+            .checked_add(mutation.bytes())
             .ok_or("journal accounting overflow")?;
         if accounted > MAX_ACCOUNTED_BYTES {
             return Err("journal batch too large");
         }
-        out.push(Mutation {
-            key: key.into(),
-            entry: if flags == 0 {
-                None
-            } else {
-                Some(Entry {
-                    value: value.into(),
-                    expires_at_ms: (flags == 3).then_some(expiry),
-                })
-            },
-        });
+        out.push(mutation);
         pos = value_end;
     }
     if pos != bytes.len() {

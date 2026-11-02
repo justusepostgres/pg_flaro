@@ -9,7 +9,7 @@ pub type Mutations = smallvec::SmallVec<[Mutation; 1]>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
-    pub value: Bytes,
+    pub value: crate::value::Value,
     pub expires_at_ms: Option<i64>,
 }
 #[derive(Clone, Debug)]
@@ -19,7 +19,7 @@ pub struct Mutation {
 }
 impl Mutation {
     pub fn bytes(&self) -> usize {
-        self.key.len() + self.entry.as_ref().map_or(0, |e| e.value.len()) + 128
+        self.key.len() + self.entry.as_ref().map_or(0, |e| e.value.memory_bytes()) + 128
     }
 }
 pub struct Engine {
@@ -31,7 +31,7 @@ pub struct Engine {
     next_expiry: Option<i64>,
 }
 fn cost(k: &[u8], e: &Entry) -> usize {
-    k.len() + e.value.len() + 128
+    k.len() + e.value.memory_bytes() + 128
 }
 fn integer(b: &[u8]) -> Option<i64> {
     let s = std::str::from_utf8(b).ok()?;
@@ -70,10 +70,51 @@ impl Engine {
         self.entries.insert(key.into(), entry);
         Ok(())
     }
-    fn get(&self, key: &[u8], now: i64) -> Option<&Entry> {
+    pub(crate) fn get(&self, key: &[u8], now: i64) -> Option<&Entry> {
         self.entries
             .get(key)
             .filter(|e| e.expires_at_ms.is_none_or(|t| t > now))
+    }
+    pub fn validate_cluster_ownership(
+        &self,
+        topology: &crate::cluster::Topology,
+    ) -> Result<(), &'static str> {
+        for key in self.entries.keys() {
+            let slot = crate::cluster::keyslot(key);
+            if topology.owners[slot as usize] != topology.local
+                && !topology.importing.contains_key(&slot)
+            {
+                return Err("persisted key belongs to another shard");
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn slot_keys(&self, slot: u16, now: i64, limit: usize) -> Result<Vec<Vec<u8>>, ()> {
+        let mut result = Vec::new();
+        let mut bytes = 0;
+        for (key, _) in self
+            .entries
+            .iter()
+            .filter(|(key, entry)| {
+                crate::cluster::keyslot(key) == slot && entry.expires_at_ms.is_none_or(|t| t > now)
+            })
+            .take(limit)
+        {
+            bytes += key.len() + 32;
+            if bytes > crate::protocol::MAX_FRAME {
+                return Err(());
+            }
+            result.push(key.to_vec());
+        }
+        Ok(result)
+    }
+    pub(crate) fn slot_count(&self, slot: u16, now: i64) -> usize {
+        self.entries
+            .iter()
+            .filter(|(key, entry)| {
+                crate::cluster::keyslot(key) == slot && entry.expires_at_ms.is_none_or(|t| t > now)
+            })
+            .count()
     }
     fn track_expiry(&mut self, expiry: Option<i64>) {
         if let Some(expiry) = expiry {
@@ -81,9 +122,13 @@ impl Engine {
         }
     }
     pub fn get_into(&self, key: &[u8], now: i64, output: &mut Vec<u8>) {
-        crate::protocol::bulk(self.get(key, now).map(|e| e.value.as_ref()), output);
+        if self.get(key, now).is_some_and(|e| e.value.kind() != 0) {
+            crate::collections::WRONGTYPE.encode(output);
+        } else {
+            crate::protocol::bulk(self.get(key, now).map(|e| e.value.as_ref()), output);
+        }
     }
-    fn put(
+    pub(crate) fn put(
         &mut self,
         key: &[u8],
         value: &[u8],
@@ -98,7 +143,7 @@ impl Engine {
         }
         let key: Bytes = existing.map_or_else(|| Arc::from(key), |(stored, _)| stored.clone());
         let entry = Entry {
-            value: Arc::from(value),
+            value: value.into(),
             expires_at_ms,
         };
         if !submit(smallvec::smallvec![Mutation {
@@ -111,6 +156,48 @@ impl Engine {
         self.entries.insert(key, entry);
         self.used = used;
         Reply::Simple("OK")
+    }
+    pub(crate) fn apply_typed(
+        &mut self,
+        changes: Vec<(Vec<u8>, Option<Entry>)>,
+        reply: Reply,
+        submit: &mut impl FnMut(Mutations) -> bool,
+    ) -> Reply {
+        let mut used = self.used;
+        for (key, entry) in &changes {
+            used -= self.entries.get(key.as_slice()).map_or(0, |e| cost(key, e));
+            used += entry.as_ref().map_or(0, |e| cost(key, e));
+            if entry.as_ref().is_some_and(|e| {
+                e.value.kind() != 0
+                    && (key.len() + e.value.len() + 128 > crate::protocol::MAX_FRAME
+                        || cost(key, e) > crate::server::MAX_PENDING_BYTES / 2)
+            }) {
+                return Reply::Error("ERR collection exceeds maximum size");
+            }
+        }
+        if used > self.limit {
+            return Reply::Error("OOM command not allowed when used memory > 'maxmemory'");
+        }
+        let mutations: Mutations = changes
+            .iter()
+            .map(|(k, e)| Mutation {
+                key: k.clone().into(),
+                entry: e.clone(),
+            })
+            .collect();
+        if !submit(mutations) {
+            return Reply::Error("MISCONF persistence backlog full or unavailable");
+        }
+        for (key, entry) in changes {
+            if let Some(entry) = entry {
+                self.track_expiry(entry.expires_at_ms);
+                self.entries.insert(key.into(), entry);
+            } else {
+                self.entries.remove(key.as_slice());
+            }
+        }
+        self.used = used;
+        reply
     }
     pub fn reap(&mut self, now: i64) {
         if self.next_expiry.is_none_or(|expiry| expiry > now) {
@@ -142,6 +229,24 @@ impl Engine {
         if a.len() == 3 && eq(a[0], b"SET") {
             return self.put(a[1], a[2], None, &mut submit);
         }
+        if let Some(reply) = crate::collections::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if a.len() >= 2
+            && [b"GET".as_slice(), b"INCR", b"INCRBY"]
+                .iter()
+                .any(|cmd| eq(a[0], cmd))
+            && self.get(a[1], now).is_some_and(|e| e.value.kind() != 0)
+        {
+            return crate::collections::WRONGTYPE;
+        }
+        if eq(a[0], b"TYPE") {
+            return if a.len() == 2 {
+                Reply::Simple(self.get(a[1], now).map_or("none", |e| e.value.type_name()))
+            } else {
+                ARITY
+            };
+        }
         let cmd = a[0].to_ascii_uppercase();
         let mut changes: HashMap<Vec<u8>, Option<Entry>> = HashMap::new();
         let reply = match cmd.as_slice() {
@@ -153,7 +258,11 @@ impl Engine {
                 // request into an otherwise enormous allocation.
                 let bytes: usize = a[1..]
                     .iter()
-                    .map(|k| self.get(k, now).map_or(5, |e| e.value.len() + 32))
+                    .map(|k| {
+                        self.get(k, now)
+                            .filter(|e| e.value.kind() == 0)
+                            .map_or(5, |e| e.value.len() + 32)
+                    })
                     .sum();
                 if bytes > 2 * crate::protocol::MAX_FRAME - 32 {
                     return Reply::Error("ERR response exceeds configured limit");
@@ -161,7 +270,13 @@ impl Engine {
                 Reply::Array(
                     a[1..]
                         .iter()
-                        .map(|k| Reply::Bulk(self.get(k, now).map(|e| e.value.to_vec())))
+                        .map(|k| {
+                            Reply::Bulk(
+                                self.get(k, now)
+                                    .filter(|e| e.value.kind() == 0)
+                                    .map(|e| e.value.to_vec()),
+                            )
+                        })
                         .collect(),
                 )
             }
@@ -225,7 +340,7 @@ impl Engine {
                     changes.insert(
                         pair[0].to_vec(),
                         Some(Entry {
-                            value: Arc::from(pair[1]),
+                            value: pair[1].into(),
                             expires_at_ms: None,
                         }),
                     );

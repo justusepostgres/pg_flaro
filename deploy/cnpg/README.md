@@ -123,3 +123,13 @@ was verified on the actual CNPG planned-promotion test.
 - [CNPG primary-service templates](https://cloudnative-pg.io/docs/1.28/service_management/)
 - [CNPG API/bootstrap fields](https://github.com/cloudnative-pg/cloudnative-pg/blob/main/docs/src/cloudnative-pg.v1.md)
 - [Official ARM64 PostgreSQL operand images](https://github.com/cloudnative-pg/postgres-containers)
+
+## Redis Cluster client mode
+
+[sharded.yaml](sharded.yaml) defines three separate CNPG clusters, two PostgreSQL
+instances each, and stable RESP Services. It requires an image built from the new
+cluster-mode code. It uses synchronous replication with required data durability
+and permits shard-to-shard migration traffic through the private NetworkPolicy.
+See [cluster operations and recovery](../../docs/redis-cluster.md). This new
+manifest has not yet been exercised on OKE; earlier CNPG results cover the
+single-shard build.

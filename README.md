@@ -10,6 +10,13 @@ performance target, not a general performance guarantee. The deployment target i
 Linux ARM64. See [the CNPG deployment notes](deploy/cnpg/README.md) for current
 deployment limitations.
 
+Hashes, lists, sets, and sorted sets are supported through a documented
+[collection command subset](docs/data-types.md), including persistence and migration.
+
+Redis Cluster client mode and online slot moves are available as an opt-in
+experimental feature. See [cluster setup, compatibility, migration recovery, and
+limits](docs/redis-cluster.md). Each shard uses its own PostgreSQL/CNPG cluster.
+
 ## Architecture and durability
 
 ```text
@@ -163,7 +170,8 @@ CREATE EXTENSION pg_cache;
 ```
 
 The worker waits for the schema before listening. All settings require restart.
-Exactly one persistence database and one listener are supported per cluster.
+Exactly one persistence database and one listener are supported per PostgreSQL cluster.
+Redis sharding uses multiple such clusters.
 
 ```sh
 redis-cli -h 127.0.0.1 -p 6380 SET greeting hello PX 60000
@@ -201,7 +209,7 @@ cargo run -p pg-cache-core --bin memory-server -- 6380
 
 ## Command compatibility
 
-Keys and values are binary-safe strings. Commands are case-insensitive. TCP
+Keys, string values, hash fields, and collection members are binary-safe. Commands are case-insensitive. TCP
 fragmentation, multiple connections, and pipelining are supported. Only RESP arrays
 of bulk strings are accepted; inline commands are not supported.
 
@@ -216,17 +224,21 @@ of bulk strings are accepted; inline commands are not supported.
 | `INCR`, `INCRBY` | Signed 64-bit integer semantics, checked overflow, retains TTL |
 | `EXPIRE`, `PEXPIRE` | Basic form only; nonpositive TTL deletes immediately |
 | `TTL`, `PTTL`, `PERSIST` | Redis missing/no-expiration sentinel values |
+| `TYPE` | `none`, `string`, `hash`, `list`, `set`, or `zset` |
+| Hash/list/set/sorted-set commands | [54 supported collection commands, persistence and limits](docs/data-types.md) |
 | `SELECT 0` | Only database 0 |
 | `PGCACHE.STATS` | Extension-specific persistence counters |
+| `COMMAND` | Supported command metadata and key discovery |
+| `CLUSTER`, `ASKING`, `MIGRATE`, `PGCACHE.MIGRATION` | Opt-in [cluster subset and online resharding](docs/redis-cluster.md) |
 
-Other commands/options return errors. In particular: no hashes, lists, sets, sorted
-sets, streams, Pub/Sub, Lua, transactions, WATCH, replication protocol, Cluster,
-Sentinel, eviction, `SET GET/KEEPTTL/EXAT/PXAT`, or conditional EXPIRE options.
+Other commands/options return errors. Streams, Pub/Sub, Lua, transactions, WATCH, Redis replication and cluster-bus protocols,
+Sentinel, eviction, `SET GET/KEEPTTL/EXAT/PXAT`, and conditional EXPIRE options remain unsupported.
 Malformed/unsupported syntax errors are not all byte-for-byte Redis matches.
 
 ## Limits and remaining work
 
-- Cache accounting includes key/value lengths plus 128 bytes per entry. It is not
+- String accounting includes key/value lengths plus 128 bytes per entry. Collections
+  also account for decoded payloads and estimated item overhead. This is not
   an exact RSS limit; hash-table capacity, allocations, socket buffers, pending
   writes, and PostgreSQL memory add overhead.
 - Maximum command frame: 1 MiB; maximum arguments: 1,024; maximum clients: 128.
