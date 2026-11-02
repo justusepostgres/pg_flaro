@@ -3,14 +3,24 @@
 Requires redis-py; starts disposable PostgreSQL and Redis processes only.
 """
 
-import argparse, hashlib, json, os, platform, shutil, subprocess, sys, tempfile, time
+import argparse
+import hashlib
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
+
+import redis
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-import redis
-from cluster_integration import Shard, eventually
-from integration import free_port
+from cluster_integration import Shard, eventually  # noqa: E402
+from integration import free_port  # noqa: E402
 
 SEED = b"seed" + b"x" * 60
 OPS = ["hset", "hget", "lset", "lindex", "set-churn", "sismember", "zincrby", "zscore"]

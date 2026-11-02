@@ -1,0 +1,31 @@
+{
+  "baseline_revision": "6121d96cda541a280e2101a2f7cc6300a5d1102f",
+  "release_revision": "bec5d1f708a5424a0126428380b68bb9be8d72c4",
+  "release_source_archive_sha256": "788f367962f28bee64ef8e09585d9ad0380655c99d8d27ff9e2f03c764ed249e",
+  "platform": "OCI VM.Standard.A1.Flex; dedicated OKE worker",
+  "cpu": "4 Ampere Altra / ARM Neoverse-N1 cores, one thread per core",
+  "node_memory_gib": 24,
+  "pod_cpu_limit": 4,
+  "pod_memory_limit_gib": 20,
+  "block_volume_gib": 500,
+  "block_volume_vpus_per_gb": 10,
+  "kernel": "Linux 6.12.0-204.92.4.4.3.el9uek.aarch64",
+  "rustc": "1.92.0 (ded5c06cf 2025-12-08), LLVM 21.1.3, aarch64-unknown-linux-gnu",
+  "cpu_affinity": "default scheduler, no manual affinity",
+  "network": "loopback; driver and both servers in one pod/cgroup",
+  "validation": {
+    "rust_tests": 49,
+    "redis_differential_checks_per_mode": 1346,
+    "persistence_modes": [
+      "direct",
+      "journal"
+    ],
+    "cluster_shards": 3,
+    "client": "redis-py 6.4.0"
+  },
+  "notes": [
+    "Baseline trials are one-second single repetitions; release trials are three seconds with three repetitions.",
+    "AOF/RDB disabled for Redis; Flaro uses asynchronous WAL-logged PostgreSQL persistence.",
+    "The same Rust driver binary was used for baseline and release measurements."
+  ]
+}

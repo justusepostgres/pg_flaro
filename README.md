@@ -12,6 +12,10 @@ deployment limitations.
 
 Hashes, lists, sets, and sorted sets are supported through a documented
 [collection command subset](docs/data-types.md), including persistence and migration.
+The [Linux ARM64 collection benchmark](docs/collection-performance-arm64.md)
+measured higher median throughput in 31 of 32 cases (up to 2.33× Redis), with the
+remaining case 0.33% slower. Larger-collection write p99 was still 1.04–1.98×
+Redis's latency; these results do not establish universal Redis parity.
 
 Redis Cluster client mode and online slot moves are available as an opt-in
 experimental feature. See [cluster setup, compatibility, migration recovery, and

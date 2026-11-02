@@ -72,7 +72,7 @@ leaves live data unchanged. Cluster durability barriers capture dirty keys befor
 waiting for commit.
 
 Collection-only handoffs use `flush_ms` (at least 5 ms), or happen earlier under
-memory pressure. Mixed/string batches retain the 5-ms handoff window. The SQL
+memory pressure. Ordinary string workloads retain the 5-ms handoff window. The SQL
 worker still flushes on its interval or capacity threshold; these intervals are
 batching targets, not a maximum crash-loss window or a durability guarantee.
 The old journal byte accounting remains stable across this memory-layout change.
@@ -106,7 +106,8 @@ and absolute expiry using the same durable commit/replay protocol as strings.
   frequently changed collections can amplify WAL and CPU work. Rank/range queries
   currently traverse the ordered score index.
 - Redis performance depends on collection size, command, pipeline depth, and flush
-  settings. Earlier string benchmarks do not establish collection performance.
+  settings. See the [Linux ARM64 collection results](collection-performance-arm64.md)
+  for throughput, tail latency, exact workloads, and limits.
 - Unsupported examples include blocking list operations, `LMOVE`/`RPOPLPUSH`,
   `LINSERT`/`LPOS`, `SMOVE`, random-member/pop commands, cursor scans, hash-field TTLs,
   `HINCRBYFLOAT`, sorted-set algebra, `BYLEX`, `ZRANGESTORE`, and blocking/multi-key
