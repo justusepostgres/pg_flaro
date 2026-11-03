@@ -1,7 +1,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/flaro-logo-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/assets/flaro-logo-light.svg">
-  <img alt="Flaro logo: a blue elephant with an orange flame and the flaro wordmark" src="docs/assets/flaro-logo-light.svg" width="420">
+  <img alt="Flaro logo: a blue elephant with an orange flame and the pg_flaro wordmark" src="docs/assets/flaro-logo-light.svg" width="520">
 </picture>
 
 # Flaro (`pg_flaro`)
