@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/flaro-logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/flaro-logo-light.svg">
+  <img alt="Flaro logo: a blue elephant with an orange flame and the flaro wordmark" src="docs/assets/flaro-logo-light.svg" width="420">
+</picture>
+
 # Flaro (`pg_flaro`)
 
 Experimental PostgreSQL 17 extension written with Rust/pgrx. The current SQL
