@@ -1,8 +1,10 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/flaro-logo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/assets/flaro-logo-light.svg">
-  <img alt="Flaro logo: a blue elephant with an orange flame and the pg_flaro wordmark" src="docs/assets/flaro-logo-light.svg" width="520">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/pg-flaro-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/pg-flaro-logo-light.svg">
+    <img alt="pg_flaro logo: a blue elephant with an orange flame and the pg_flaro wordmark" src="docs/assets/pg-flaro-logo-light.svg" width="520">
+  </picture>
+</p>
 
 # Flaro (`pg_flaro`)
 
