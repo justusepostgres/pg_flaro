@@ -191,15 +191,18 @@ redis-cli -h 127.0.0.1 -p 6380 GET greeting
 redis-cli -h 127.0.0.1 -p 6380 PGCACHE.STATS
 ```
 
-Use RESP2 clients, database 0, no authentication, and disable optional unsupported
-connection handshakes if your library treats their errors as fatal. `HELLO`/RESP3,
-`AUTH`, and `CLIENT` are not implemented. The listener defaults to
+Use RESP2 or RESP3 clients and database 0. `HELLO` supports protocol negotiation,
+SETNAME, and the default nopass user; it reports Flaro’s own product/version.
+`CLIENT ID`, `GETNAME`, `SETNAME`, `SETINFO`, and `UNBLOCK` are supported. Standalone `AUTH`
+and configurable authentication are not implemented. The listener defaults to
 `127.0.0.1`; set `pg_cache.listen_address` to an explicit IP (restart required)
 for private remote access. PostgreSQL's `pg_hba.conf` does not authenticate RESP
 connections. Any process that can reach the port can read/write the cache.
 TLS, Redis ACLs and multi-tenancy are not implemented. See
 [CNPG deployment](deploy/cnpg/README.md) for the private Service example and test
-status. With redis-py use `protocol=2` and `pipeline(transaction=False)`;
+status. With redis-py use `protocol=2` or `protocol=3`. Default `pipeline()`
+transactions are supported for implemented commands; `pipeline(transaction=False)`
+uses ordinary pipelining. `WATCH`/`UNWATCH` support optimistic transactions;
 `incr()`, `incrby()`, `setex()` and `psetex()` use supported commands.
 
 For a disposable local PostgreSQL test cluster, without installing any system files:
@@ -222,29 +225,58 @@ cargo run -p pg-cache-core --bin memory-server -- 6380
 ## Command compatibility
 
 Keys, string values, hash fields, and collection members are binary-safe. Commands are case-insensitive. TCP
-fragmentation, multiple connections, and pipelining are supported. Only RESP arrays
-of bulk strings are accepted; inline commands are not supported.
+fragmentation, multiple connections, and pipelining are supported. Requests accept
+RESP arrays of bulk strings and Redis-style inline commands, including quoted
+arguments and escapes. Inline lines are capped at 64 KiB; the existing argument
+and reply limits still apply. RESP3 uses maps, sets, doubles and nulls where
+required by the supported commands; push notifications and client tracking remain
+unsupported. `RESET` restores RESP2.
 
 | Commands | Supported behavior |
 |---|---|
 | `PING`, `ECHO`, `QUIT` | Basic connection commands |
+| `WATCH`, `UNWATCH` | Optimistic transaction guards; admitted writes and expiration invalidate watched keys; EXEC returns null on conflict |
+| `MULTI`, `EXEC`, `DISCARD` | Bounded transaction queues, runtime-error replies, atomic persistence admission; same-slot cluster transactions |
+| `RESET`, `TIME` | Reset implemented connection state while retaining client/library identity; server seconds and microseconds |
+| `CLIENT ID`, `CLIENT SETNAME`, `CLIENT GETNAME`, `CLIENT SETINFO`, `CLIENT UNBLOCK` | Connection identity and metadata; cancel a local blocked client with `TIMEOUT` (default) or `ERROR` |
 | `GET`, `MGET` | Missing/expired keys return null bulk strings |
-| `SET` | `NX` or `XX`; `EX seconds` or `PX milliseconds`; overwrites clear old TTL |
+| `SET` | `NX`/`XX`, `GET`, `KEEPTTL`, `EX`/`PX`/`EXAT`/`PXAT`; overwrites clear TTL unless preserved or replaced |
+| `GETEX` | Return a string and optionally set its expiration or `PERSIST` |
 | `SETEX`, `PSETEX` | Atomic value replacement with a positive seconds/milliseconds TTL |
 | `MSET` | Atomic within the cache, including on memory/backlog rejection |
-| `DEL`, `EXISTS` | Multiple keys; Redis duplicate-key counting behavior |
-| `INCR`, `INCRBY` | Signed 64-bit integer semantics, checked overflow, retains TTL |
-| `EXPIRE`, `PEXPIRE` | Basic form only; nonpositive TTL deletes immediately |
-| `TTL`, `PTTL`, `PERSIST` | Redis missing/no-expiration sentinel values |
+| `DEL`, `UNLINK`, `EXISTS` | Multiple keys; Redis duplicate-key counting behavior; `UNLINK` reclaims removed values on a worker after admission/transaction commit |
+| `RANDOMKEY` | Random live key or null; currently scans the local shard |
+| `DUMP`, `RESTORE` | Native Redis value interchange, including compact/compressed encodings and hash field deadlines; `REPLACE` and `ABSTTL`; access/eviction metadata and full Redis size limits remain incomplete |
+| `KEYS`, `DBSIZE` | Binary glob key enumeration and resident key count; `KEYS` uses the existing reply-size limit |
+| `TOUCH` | Count existing key arguments, including duplicates; eviction/access metadata remains unsupported |
+| `GETDEL`, `GETSET` | Return the previous string and atomically delete or replace it |
+| `SETNX`, `MSETNX` | Set only if all target keys are absent; multi-key writes are atomic |
+| `GETRANGE`, `SUBSTR`, `SETRANGE` | Byte ranges, negative read indexes, zero-filled write gaps |
+| `SCAN`, `HSCAN`, `SSCAN`, `ZSCAN` | Opaque cursors, `MATCH`, `COUNT`; `SCAN TYPE`, `HSCAN NOVALUES`; pages currently examine the full source |
+| `SORT`, `SORT_RO` | Lists/sets/sorted sets; numeric or C-locale alpha order, `ASC`/`DESC`, `LIMIT`, external `BY`/`GET`, hash-field lookups and `SORT STORE` |
+| `LCS` | Binary longest common subsequence; `LEN`, `IDX`, `MINMATCHLEN`, `WITHMATCHLEN`; temporary table limited to 1 MiB |
+| `APPEND`, `STRLEN` | Binary-safe append and byte length; append preserves TTL |
+| `INCRBYFLOAT`, `HINCRBYFLOAT` | Native long-double arithmetic and decimal replies; finite results, TTL preservation, atomic persistence admission |
+| `INCR`, `INCRBY`, `DECR`, `DECRBY` | Signed 64-bit integer semantics, checked overflow, retains TTL |
+| `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` | Relative/absolute deadlines; `NX`, `XX`, `GT`, `LT` conditions; past deadlines delete immediately |
+| `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST` | Redis missing/no-expiration sentinel values |
+| `RENAME`, `RENAMENX`, `COPY` | Atomic typed-value rename/copy, preserving TTL; `COPY REPLACE` and `DB 0` |
+| `GETBIT`, `SETBIT`, `BITCOUNT`, `BITPOS` | String-backed bits; byte/bit counting and search ranges; writes preserve TTL |
+| `BITFIELD`, `BITFIELD_RO` | Signed/unsigned fields, `#` offsets, `GET`/`SET`/`INCRBY`, `WRAP`/`SAT`/`FAIL`; read-only variant |
+| `BITOP` | `AND`, `OR`, `XOR`, `NOT`, `DIFF`, `DIFF1`, `ANDOR`, `ONE`; atomic destination replacement |
+| `HGETEX`, `HSETEX`, `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`, `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `HPERSIST` | Hash-field expiration, conditional deadlines, TTL inspection and persistence removal |
+| `GEOADD`, `GEOPOS`, `GEOHASH`, `GEODIST`, `GEOSEARCH`, `GEOSEARCHSTORE`, `GEORADIUS`, `GEORADIUSBYMEMBER` and `_RO` variants | Redis geospatial scores stored in sorted sets, coordinate/hash lookup and distance units |
+| `PFADD`, `PFCOUNT`, `PFMERGE`, `PFDEBUG`, `PFSELFTEST` | Redis-format HyperLogLog strings, cached cardinality, multi-key union, TTL-preserving writes |
 | `TYPE` | `none`, `string`, `hash`, `list`, `set`, or `zset` |
-| Hash/list/set/sorted-set commands | [54 supported collection commands, persistence and limits](docs/data-types.md) |
+| Hash/list/set/sorted-set commands | [Supported collection commands, persistence and limits](docs/data-types.md) |
 | `SELECT 0` | Only database 0 |
 | `PGCACHE.STATS` | Extension-specific persistence counters |
-| `COMMAND` | Supported command metadata and key discovery |
+| `COMMAND`, `COMMAND COUNT`, `COMMAND INFO`, `COMMAND LIST`, `COMMAND GETKEYS`, `COMMAND GETKEYSANDFLAGS`, `COMMAND DOCS`, `COMMAND HELP` | Supported command metadata and key discovery; LIST filters by PATTERN, ACLCAT or MODULE |
 | `CLUSTER`, `ASKING`, `MIGRATE`, `PGCACHE.MIGRATION` | Opt-in [cluster subset and online resharding](docs/redis-cluster.md) |
 
-Other commands/options return errors. Streams, Pub/Sub, Lua, transactions, WATCH, Redis replication and cluster-bus protocols,
-Sentinel, eviction, `SET GET/KEEPTTL/EXAT/PXAT`, and conditional EXPIRE options remain unsupported.
+Streams and Pub/Sub are intentionally outside the compatibility target.
+Other commands/options return errors. Lua, Redis replication and cluster-bus protocols,
+Sentinel and eviction remain unsupported.
 Malformed/unsupported syntax errors are not all byte-for-byte Redis matches.
 
 ## Limits and remaining work
@@ -253,7 +285,7 @@ Malformed/unsupported syntax errors are not all byte-for-byte Redis matches.
   also account for decoded payloads and estimated item overhead. This is not
   an exact RSS limit; hash-table capacity, allocations, socket buffers, pending
   writes, and PostgreSQL memory add overhead.
-- Maximum command frame: 1 MiB; maximum arguments: 1,024; maximum clients: 128.
+- Maximum command frame: 1 MiB; array headers accept up to Redis's 2,147,483,647 argument count, with completed requests constrained by the frame limit; maximum clients: 128.
   Slow clients are disconnected when queued responses exceed 2 MiB. Large `MGET`
   responses are rejected before copying values if they would exceed the limit.
 - Pending mutations: direct mode permits 16 MiB by payload accounting. Journal

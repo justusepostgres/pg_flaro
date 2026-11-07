@@ -1,5 +1,7 @@
 //! Typed immutable values with a versioned binary representation for persistence.
+mod hash;
 use crate::engine::Bytes;
+pub use hash::Hash;
 use im::{OrdSet, Vector};
 use std::collections::{HashMap, HashSet};
 // Reserve room for sparsely populated persistent-tree roots and vector chunks.
@@ -46,7 +48,7 @@ impl SortedSet {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Collection {
-    Hash(HashMap<Bytes, Bytes>),
+    Hash(Hash),
     List(Vector<Bytes>),
     Set(HashSet<Bytes>),
     ZSet(SortedSet),
@@ -54,7 +56,7 @@ pub enum Collection {
 impl Collection {
     pub fn empty(kind: u8) -> Self {
         match kind {
-            1 => Self::Hash(HashMap::new()),
+            1 => Self::Hash(Hash::default()),
             2 => Self::List(Vector::new()),
             3 => Self::Set(HashSet::new()),
             4 => Self::ZSet(SortedSet::default()),
@@ -121,6 +123,35 @@ impl AsRef<[u8]> for Value {
     }
 }
 impl Value {
+    pub(crate) fn hash_expiration(&self) -> Option<i64> {
+        match self.collection() {
+            Some(Collection::Hash(hash)) => hash.next_expiration(),
+            _ => None,
+        }
+    }
+    pub(crate) fn has_live_fields(&self, now: i64) -> bool {
+        match self.collection() {
+            Some(Collection::Hash(hash)) => hash.has_live_fields(now),
+            _ => true,
+        }
+    }
+    pub(crate) fn expire_hash_fields(&self, now: i64) -> Option<Option<Self>> {
+        if self.hash_expiration().is_none_or(|deadline| deadline > now) {
+            return None;
+        }
+        let Collection::Hash(mut hash) = self.collection().unwrap().clone() else {
+            unreachable!()
+        };
+        hash.remove_expired(now);
+        Some(if hash.is_empty() {
+            None
+        } else {
+            Some(
+                Self::from_collection(Collection::Hash(hash))
+                    .expect("removing fields reduces encoded size"),
+            )
+        })
+    }
     pub fn kind(&self) -> u8 {
         match self {
             Self::String(_) => 0,
@@ -171,17 +202,28 @@ impl Value {
         let mut bytes = (old.len() - 8 - previous.len() * fields * 4) as isize;
         match (previous, &data) {
             (Collection::Hash(a), Collection::Hash(b)) => {
-                let step = if args[0].eq_ignore_ascii_case(b"HSET")
+                if a.has_expirations() || b.has_expirations() {
+                    return Self::from_collection(data);
+                }
+                let (start, step) = if args[0].eq_ignore_ascii_case(b"HSET")
                     || args[0].eq_ignore_ascii_case(b"HMSET")
                 {
-                    2
+                    (2, 2)
                 } else if args[0].eq_ignore_ascii_case(b"HDEL") {
-                    1
+                    (2, 1)
+                } else if args[0].eq_ignore_ascii_case(b"HGETDEL") {
+                    (4, 1)
+                } else if args[0].eq_ignore_ascii_case(b"HSETNX")
+                    || args[0].eq_ignore_ascii_case(b"HINCRBY")
+                {
+                    (2, args.len())
                 } else {
-                    args.len()
+                    // New hash commands must opt into incremental accounting;
+                    // assuming a single field silently corrupts journal totals.
+                    return Self::from_collection(data);
                 };
                 let mut seen = std::collections::HashSet::new();
-                for key in args[2..].iter().step_by(step) {
+                for key in args[start..].iter().step_by(step) {
                     if !seen.insert(*key) {
                         continue;
                     }
@@ -242,11 +284,24 @@ impl Value {
         } else {
             1
         };
-        let encoded_len = 8 + bytes + data.len() * fields * 4;
+        let expiration_count = match &data {
+            Collection::Hash(hash) => hash.expiration_count(),
+            _ => 0,
+        };
+        let expiration_bytes = if expiration_count == 0 {
+            0
+        } else {
+            data.len() * 4 + expiration_count * 8
+        };
+        let encoded_len = 8 + bytes + data.len() * fields * 4 + expiration_bytes;
         if encoded_len > crate::protocol::MAX_FRAME {
             return Err("collection exceeds maximum encoded size");
         }
-        let memory = encoded_len + bytes + data.len() * 160 + COLLECTION_BASE_MEMORY;
+        let memory = encoded_len
+            + bytes
+            + data.len() * 160
+            + COLLECTION_BASE_MEMORY
+            + expiration_count * 160;
         Ok(Self::Collection {
             memory,
             encoded_len,
@@ -268,9 +323,10 @@ impl Value {
         if kind == 0 {
             return Ok(bytes.into());
         }
+        let expiring_hash = kind == 1 && bytes.get(..4) == Some(b"COL2");
         if !(1..=4).contains(&kind)
             || bytes.len() > crate::protocol::MAX_FRAME
-            || bytes.get(..4) != Some(b"COL1")
+            || (!expiring_hash && bytes.get(..4) != Some(b"COL1"))
         {
             return Err("invalid collection header");
         }
@@ -305,8 +361,19 @@ impl Value {
                 Collection::Hash(v) => {
                     let k = field()?;
                     let value = field()?;
-                    if v.insert(k, value).is_some() {
+                    if v.insert(k.clone(), value).is_some() {
                         return Err("duplicate hash field");
+                    }
+                    if expiring_hash {
+                        let raw = field()?;
+                        if !raw.is_empty() {
+                            let deadline = i64::from_le_bytes(
+                                raw.as_ref()
+                                    .try_into()
+                                    .map_err(|_| "invalid hash expiration encoding")?,
+                            );
+                            v.set_expiration(&k, Some(deadline));
+                        }
                     }
                 }
                 Collection::List(v) => v.push_back(field()?),
@@ -338,17 +405,25 @@ impl Value {
 }
 
 fn encode(data: &Collection) -> Bytes {
-    let mut encoded = b"COL1".to_vec();
+    let expiring_hash = matches!(data, Collection::Hash(hash) if hash.has_expirations());
+    let mut encoded = if expiring_hash { b"COL2" } else { b"COL1" }.to_vec();
     encoded.extend_from_slice(&(data.len() as u32).to_le_bytes());
     let mut field = |v: &[u8]| {
         encoded.extend_from_slice(&(v.len() as u32).to_le_bytes());
         encoded.extend_from_slice(v);
     };
     match data {
-        Collection::Hash(v) => {
-            for (k, v) in v {
-                field(k);
-                field(v);
+        Collection::Hash(hash) => {
+            for (key, value) in hash.iter() {
+                field(key);
+                field(value);
+                if expiring_hash {
+                    if let Some(deadline) = hash.expiration(key) {
+                        field(&deadline.to_le_bytes());
+                    } else {
+                        field(&[]);
+                    }
+                }
             }
         }
         Collection::List(v) => {

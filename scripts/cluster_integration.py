@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 import redis
 from redis.cluster import RedisCluster
 from integration import Client, RedisError, free_port, frame
+from native_cluster_transactions import check_native_cluster_transactions
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -127,6 +128,8 @@ class Shard:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--journal", action="store_true")
+    parser.add_argument("--protocol", type=int, choices=[2, 3], default=2)
+    parser.add_argument("--native-redis", type=Path, help="Compare transactions with a disposable native Redis cluster")
     options = parser.parse_args()
     bindir = Path(subprocess.check_output([os.environ.get("PGRX_PG_CONFIG_PATH", "pg_config"), "--bindir"], text=True).strip())
     artifact = ROOT / "target" / os.environ.get("PG_CACHE_PROFILE", "debug") / ("libpg_cache.dylib" if os.uname().sysname == "Darwin" else "libpg_cache.so")
@@ -144,14 +147,218 @@ def main():
             shards.append(Shard(work, i, nodes, bindir, options.journal))
         clients = [s.client() for s in shards]
         a, b, c = clients
+        assert a.cmd('CLIENT','SETNAME','cluster-probe') == b'OK'
+        assert a.cmd('CLIENT','GETNAME') == b'cluster-probe'
+        assert b.cmd('CLIENT','GETNAME') is None
+        assert isinstance(a.cmd('CLIENT','ID'),int)
+        assert a.cmd('CLIENT','SETINFO','LIB-NAME','test-client') == b'OK'
+        # CLIENT UNBLOCK is local to a serving node and resumes the target socket.
+        blocked_peer = Client(shards[0].port)
+        try:
+            if options.protocol == 3: blocked_peer.cmd('HELLO', 3)
+            blocked_id = blocked_peer.cmd('CLIENT', 'ID')
+            blocked_peer.socket.sendall(frame('BLPOP', '{bar}cancel', 0))
+            time.sleep(.05)
+            assert a.cmd('CLIENT', 'UNBLOCK', blocked_id, 'ERROR') == 1
+            expect_error(blocked_peer.read(), 'UNBLOCKED client unblocked via CLIENT UNBLOCK')
+            assert blocked_peer.cmd('PING') == b'PONG'
+            assert a.cmd('CLIENT', 'UNBLOCK', blocked_id) == 0
+        finally:
+            blocked_peer.close()
         # Real client discovers the topology and command keys, then routes pipelines.
-        cluster = RedisCluster(host="127.0.0.1", port=shards[0].port, socket_timeout=10)
+        cluster = RedisCluster(host="127.0.0.1", port=shards[0].port, socket_timeout=10, protocol=options.protocol)
         assert cluster.set("foo", b"binary\x00\xff")
         assert cluster.set("bar", b"left")
         assert cluster.get("foo") == b"binary\x00\xff"
         expect_error(a.cmd("GET", "foo"), "MOVED 12182 ")
+        a.socket.sendall(b'*0\r\n*-1\r\nPING\n\r\nGET foo\r\n')
+        assert a.read() == b'PONG'
+        expect_error(a.read(), 'MOVED 12182 ')
         expect_error(a.cmd("MSET", "foo", "x", "bar", "y"), "CROSSSLOT")
+        for command in ('BLPOP', 'BRPOP', 'BZPOPMIN', 'BZPOPMAX'):
+            expect_error(a.cmd(command, '{foo}blocking', '{bar}blocking', .01), 'CROSSSLOT')
+            expect_error(a.cmd(command, '{foo}blocking', .01), 'MOVED')
+        for command, tail in [('BLMOVE', ('LEFT', 'RIGHT', .01)), ('BRPOPLPUSH', (.01,))]:
+            expect_error(a.cmd(command, '{foo}source', '{bar}target', *tail), 'CROSSSLOT')
+            expect_error(a.cmd(command, '{foo}source', '{foo}target', *tail), 'MOVED')
+        for command, side in [('BLMPOP','LEFT'), ('BZMPOP','MIN')]:
+            expect_error(a.cmd(command, .01, 2, '{foo}a', '{bar}b', side), 'CROSSSLOT')
+            expect_error(a.cmd(command, .01, 2, '{foo}a', '{foo}b', side), 'MOVED')
+            assert a.cmd('COMMAND','GETKEYS',command,.01,2,'{foo}a','{foo}b',side)==[b'{foo}a',b'{foo}b']
+
+
         assert cluster.get("foo") == b"binary\x00\xff" and cluster.get("bar") == b"left"
+        assert c.cmd('WATCH', '{foo}watched') == b'OK'
+        assert cluster.set('{foo}watched', 'changed')
+        assert c.cmd('MULTI') == b'OK'
+        assert c.cmd('SET', '{foo}cas-result', 'never') == b'QUEUED'
+        assert c.cmd('EXEC') is None
+        assert cluster.get('{foo}cas-result') is None
+        expect_error(a.cmd('WATCH', '{foo}watched'), 'MOVED 12182 ')
+        assert c.cmd('MULTI') == b'OK'
+        assert c.cmd('SET', '{foo}tx', '1') == b'QUEUED'
+        assert c.cmd('INCR', '{foo}tx') == b'QUEUED'
+        assert c.cmd('GET', '{foo}tx') == b'QUEUED'
+        assert cluster.get('{foo}tx') is None
+        assert c.cmd('EXEC') == [b'OK', 2, b'2']
+        assert cluster.get('{foo}tx') == b'2'
+        assert c.cmd('MULTI') == b'OK'
+        assert c.cmd('SET', '{foo}tx-abort', 'bad') == b'QUEUED'
+        # A redirection while collecting commands must poison the transaction.
+        expect_error(c.cmd('SET', '{bar}tx-abort', 'bad'), 'MOVED')
+        expect_error(c.cmd('EXEC'), 'EXECABORT')
+        assert cluster.get('{foo}tx-abort') is None
+        size_before = cluster.dbsize(target_nodes=RedisCluster.PRIMARIES)
+        local_size_before = a.cmd("DBSIZE")
+        assert cluster.set('{foo}enumerate', b'value')
+        assert cluster.set('{bar}enumerate', b'value')
+        assert cluster.dbsize(target_nodes=RedisCluster.PRIMARIES) == size_before+2
+        assert a.cmd("DBSIZE") == local_size_before+1
+        assert set(cluster.keys('*enumerate', target_nodes=RedisCluster.PRIMARIES)) == {b'{foo}enumerate',b'{bar}enumerate'}
+        assert cluster.execute_command('TOUCH','{foo}enumerate','{foo}enumerate','{foo}absent') == 2
+        expect_error(a.cmd('TOUCH','{foo}enumerate','{bar}enumerate'), 'CROSSSLOT')
+        assert cluster.delete('{foo}enumerate') == 1
+        assert cluster.delete('{bar}enumerate') == 1
+        assert cluster.execute_command('INCRBYFLOAT','{foo}float',1.25) == 1.25
+        assert cluster.execute_command('HINCRBYFLOAT','{foo}float-hash','f',1.25) == 1.25
+        assert cluster.get('{foo}float') == b'1.25'
+        assert cluster.hget('{foo}float-hash','f') == b'1.25'
+        assert cluster.hset('{foo}getdel-hash', mapping={'a':'one','b':'two'}) == 2
+        assert cluster.execute_command('HGETDEL','{foo}getdel-hash','FIELDS',3,'a','a','missing') == [b'one',None,None]
+        assert cluster.hgetall('{foo}getdel-hash') == {b'b':b'two'}
+        assert cluster.hset('{foo}random-hash', mapping={'f':'v'}) == 1
+        assert cluster.execute_command('HRANDFIELD','{foo}random-hash') == b'f'
+        assert cluster.execute_command('HRANDFIELD','{foo}random-hash',-2,'WITHVALUES') == ([[b'f',b'v'],[b'f',b'v']] if options.protocol==3 else [b'f',b'v',b'f',b'v'])
+        assert cluster.zadd('{foo}random-zset', {'m':1.5}) == 1
+        assert cluster.execute_command('ZRANDMEMBER','{foo}random-zset') == b'm'
+        assert cluster.execute_command('ZRANDMEMBER','{foo}random-zset',-2,'WITHSCORES') == ([[b'm',1.5],[b'm',1.5]] if options.protocol==3 else [b'm',b'1.5',b'm',b'1.5'])
+        assert cluster.sadd('{foo}random-set','a','b','c') == 3
+        assert set(cluster.execute_command('SRANDMEMBER','{foo}random-set',99)) == {b'a',b'b',b'c'}
+        chosen = cluster.execute_command('SPOP','{foo}random-set',2)
+        assert len(chosen)==2 and len(set(chosen))==2
+        assert cluster.smembers('{foo}random-set') == {b'a',b'b',b'c'}-set(chosen)
+        assert cluster.execute_command('SPOP','{foo}random-set') in {b'a',b'b',b'c'}-set(chosen)
+        assert cluster.type('{foo}random-set') == b'none'
+        assert cluster.hset('{foo}scan-h', mapping={'a':'1','b':'2'}) == 2
+        assert dict(cluster.hscan_iter('{foo}scan-h', count=1)) == {b'a':b'1',b'b':b'2'}
+        assert cluster.sadd('{foo}scan-s', 'a', 'b') == 2
+        assert set(cluster.sscan_iter('{foo}scan-s', count=1)) == {b'a',b'b'}
+        assert cluster.zadd('{foo}scan-z', {'a':1,'b':2}) == 2
+        assert dict(cluster.zscan_iter('{foo}scan-z', count=1)) == {b'a':1.0,b'b':2.0}
+        assert {b'{foo}scan-h',b'{foo}scan-s',b'{foo}scan-z'} <= set(cluster.scan_iter(match='{foo}scan-*', count=1))
+        assert cluster.rpush('{foo}sort', '3', '1', '2') == 3
+        assert cluster.execute_command('SORT_RO', '{foo}sort') == [b'1', b'2', b'3']
+        assert cluster.execute_command('SORT', '{foo}sort', 'DESC', 'STORE', '{foo}sort-out') == 3
+        assert cluster.lrange('{foo}sort-out', 0, -1) == [b'3', b'2', b'1']
+        assert cluster.set('{foo}weight:1', '9')
+        assert cluster.execute_command('SORT', '{foo}sort', 'BY', '{foo}weight:*') == [b'2', b'3', b'1']
+        expect_error(a.cmd('SORT', '{foo}sort', 'STORE', '{bar}sort-out'), 'CROSSSLOT')
+        expect_error(a.cmd('SORT', '{foo}sort', 'BY', 'weight:*'), 'ERR BY option')
+        expect_error(a.cmd('SORT_RO', '{foo}sort', 'GET', '{bar}weight:*'), 'ERR GET option')
+        # New string commands use COMMAND metadata for cluster-aware routing.
+        assert cluster.set('{foo}lcs-a', b'ab')
+        assert cluster.set('{foo}lcs-b', b'ba')
+        assert cluster.execute_command('LCS', '{foo}lcs-a', '{foo}lcs-b') == b'b'
+        assert cluster.execute_command('LCS', '{foo}lcs-a', '{foo}lcs-b', 'LEN') == 1
+        expect_error(a.cmd('LCS', '{foo}lcs-a', '{bar}lcs-b'), 'CROSSSLOT')
+        assert cluster.execute_command('SETNX', '{foo}string-ext', '12') == 1
+        assert cluster.execute_command('APPEND', '{foo}string-ext', '3') == 3
+        assert cluster.execute_command('STRLEN', '{foo}string-ext') == 3
+        assert cluster.execute_command('DECR', '{foo}string-ext') == 122
+        assert cluster.execute_command('DECRBY', '{foo}string-ext', 2) == 120
+        assert cluster.execute_command('GETSET', '{foo}string-ext', 'abc') == b'120'
+        assert cluster.execute_command('SETRANGE', '{foo}string-ext', 4, 'z') == 5
+        assert cluster.execute_command('GETRANGE', '{foo}string-ext', 2, -1) == b'c\0z'
+        assert cluster.execute_command('SUBSTR', '{foo}string-ext', 0, 1) == b'ab'
+        assert cluster.execute_command('MSETNX', '{foo}nx-a', 'a', '{foo}nx-b', 'b') == 1
+        assert cluster.execute_command('MSETNX', '{foo}nx-c', 'c', '{foo}nx-a', 'x') == 0
+        assert cluster.get('{foo}nx-c') is None
+        expect_error(a.cmd('MSETNX', '{bar}nx', 'x', '{foo}nx', 'y'), 'CROSSSLOT')
+        assert cluster.execute_command('GETDEL', '{foo}string-ext') == b'abc\0z'
+        assert cluster.get('{foo}string-ext') is None
+        assert cluster.set('{foo}expiry-ext', 'v')
+        assert cluster.execute_command('PEXPIREAT', '{foo}expiry-ext', 4102444800501, 'NX') == 1
+        assert cluster.execute_command('PEXPIRETIME', '{foo}expiry-ext') == 4102444800501
+        assert cluster.execute_command('EXPIRETIME', '{foo}expiry-ext') == 4102444801
+        assert cluster.execute_command('EXPIREAT', '{foo}expiry-ext', 4102444800, 'XX', 'GT') == 0
+        assert cluster.execute_command('EXPIRE', '{foo}expiry-ext', 0, 'XX', 'LT') == 1
+        assert cluster.execute_command('SET', '{foo}getex-ext', 'v', 'PXAT', 4102444800501)
+        assert cluster.execute_command('SET', '{foo}getex-ext', 'new', 'GET', 'KEEPTTL', get=True) == b'v'
+        assert cluster.execute_command('GETEX', '{foo}getex-ext', 'PERSIST') == b'new'
+        assert cluster.execute_command('PEXPIRETIME', '{foo}getex-ext') == -1
+        assert cluster.execute_command('GETEX', '{foo}getex-ext', 'PXAT', 1) == b'new'
+        assert cluster.get('{foo}getex-ext') is None
+        assert cluster.execute_command('SETBIT', '{foo}bitmap', 0, 1) == 0
+        assert cluster.execute_command('SETBIT', '{foo}bitmap', 8, 1) == 0
+        assert cluster.execute_command('GETBIT', '{foo}bitmap', 0) == 1
+        assert cluster.execute_command('BITPOS', '{foo}bitmap', 1, 1, 8, 'BIT') == 8
+        assert cluster.execute_command('BITOP', 'NOT', '{foo}bitmap-not', '{foo}bitmap') == 2
+        assert cluster.get('{foo}bitmap-not') == b'\x7f\x7f'
+        assert cluster.execute_command('BITFIELD', '{foo}field', 'SET', 'i8', 0, 127, 'INCRBY', 'i8', 0, 1) == [0, -128]
+        assert cluster.execute_command('BITFIELD_RO', '{foo}field', 'GET', 'i8', 0) == [-128]
+        expect_error(a.cmd('BITOP', 'OR', '{foo}bitmap-not', '{foo}bitmap', '{bar}bitmap'), 'CROSSSLOT')
+        expect_error(a.cmd('BITOP', 'NOT', '{bar}bitmap-not', '{foo}bitmap'), 'CROSSSLOT')
+        assert cluster.execute_command('BITCOUNT', '{foo}bitmap', 1, 8, 'BIT') == 1
+        assert cluster.rpush('{foo}list-position', 'a', 'b', 'a') == 3
+        assert cluster.execute_command('LINSERT', '{foo}list-position', 'AFTER', 'a', 'c') == 4
+        assert cluster.execute_command('LPOS', '{foo}list-position', 'a', 'COUNT', 0) == [0, 3]
+        assert cluster.execute_command('LMOVE', '{foo}list-position', '{foo}list-moved', 'RIGHT', 'LEFT') == b'a'
+        assert cluster.execute_command('RPOPLPUSH', '{foo}list-moved', '{foo}list-position') == b'a'
+        expect_error(a.cmd('LMOVE', '{foo}list-position', '{bar}list-moved', 'LEFT', 'RIGHT'), 'CROSSSLOT')
+        expect_error(a.cmd('RPOPLPUSH', '{foo}list-position', '{bar}list-moved'), 'CROSSSLOT')
+        assert cluster.sadd('{foo}set-source', 'member') == 1
+        assert cluster.execute_command('SMOVE', '{foo}set-source', '{foo}set-target', 'member') == 1
+        assert cluster.sismember('{foo}set-target', 'member')
+        expect_error(a.cmd('SMOVE', '{foo}set-target', '{bar}set-target', 'member'), 'CROSSSLOT')
+        assert cluster.zadd('{foo}rank-score', {'a': 1.5, 'b': 1.5}) == 2
+        assert cluster.execute_command('ZRANK', '{foo}rank-score', 'b', 'WITHSCORE') == [1, 1.5 if options.protocol==3 else b'1.5']
+        assert cluster.execute_command('ZREVRANK', '{foo}rank-score', 'b', 'WITHSCORE') == [0, 1.5 if options.protocol==3 else b'1.5']
+        assert cluster.sadd('{foo}card-a', 'a', 'b', 'c') == 3
+        assert cluster.sadd('{foo}card-b', 'b', 'c') == 2
+        assert cluster.execute_command('SINTERCARD', 2, '{foo}card-a', '{foo}card-b', 'LIMIT', 1) == 1
+        assert a.cmd('COMMAND', 'GETKEYS', 'SINTERCARD', 2, '{foo}card-a', '{foo}card-b', 'LIMIT', 1) == [b'{foo}card-a', b'{foo}card-b']
+        expect_error(a.cmd('SINTERCARD', 2, '{foo}card-a', '{bar}card-b'), 'CROSSSLOT')
+        assert cluster.rpush('{foo}mpop', 'a', 'b', 'c') == 3
+        assert cluster.execute_command('LMPOP', 2, '{foo}mpop-missing', '{foo}mpop', 'RIGHT', 'COUNT', 2) == [b'{foo}mpop', [b'c', b'b']]
+        assert a.cmd('COMMAND', 'GETKEYS', 'LMPOP', 2, '{foo}mpop-missing', '{foo}mpop', 'RIGHT', 'COUNT', 2) == [b'{foo}mpop-missing', b'{foo}mpop']
+        expect_error(a.cmd('LMPOP', 2, '{foo}mpop', '{bar}mpop', 'LEFT'), 'CROSSSLOT')
+        assert cluster.zadd('{foo}zmpop', {'a': 1, 'b': 2}) == 2
+        popped = cluster.execute_command('ZMPOP', 2, '{foo}zmpop-missing', '{foo}zmpop', 'MAX', 'COUNT', 1)
+        assert popped[0] == b'{foo}zmpop' and popped[1][0][0] == b'b' and float(popped[1][0][1]) == 2
+        assert a.cmd('COMMAND', 'GETKEYS', 'ZMPOP', 2, '{foo}zmpop-missing', '{foo}zmpop', 'MAX') == [b'{foo}zmpop-missing', b'{foo}zmpop']
+        expect_error(a.cmd('ZMPOP', 2, '{foo}zmpop', '{bar}zmpop', 'MIN'), 'CROSSSLOT')
+        assert cluster.zadd('{foo}range-source', {'a': 0, 'b': 0, 'c': 0}) == 3
+        assert cluster.execute_command('ZRANGESTORE', '{foo}range-dest', '{foo}range-source', '[a', '(c', 'BYLEX') == 2
+        assert cluster.zrange('{foo}range-dest', 0, -1) == [b'a', b'b']
+        expect_error(a.cmd('ZRANGESTORE', '{bar}range-dest', '{foo}range-source', 0, -1), 'CROSSSLOT')
+        assert cluster.execute_command('ZLEXCOUNT', '{foo}range-source', '[a', '(c') == 2
+        assert cluster.execute_command('ZRANGEBYLEX', '{foo}range-source', '[a', '(c') == [b'a', b'b']
+        assert cluster.execute_command('ZREVRANGEBYLEX', '{foo}range-source', '[c', '[b') == [b'c', b'b']
+        assert cluster.execute_command('ZREMRANGEBYLEX', '{foo}range-source', '[a', '[a') == 1
+        assert cluster.zadd('{foo}diff-a', {'a': 1, 'b': 2}) == 2
+        assert cluster.sadd('{foo}diff-b', 'b') == 1
+        assert cluster.execute_command('ZDIFF', 2, '{foo}diff-a', '{foo}diff-b') == [b'a']
+        assert cluster.execute_command('ZDIFFSTORE', '{foo}diff-target', 2, '{foo}diff-a', '{foo}diff-b') == 1
+        assert a.cmd('COMMAND', 'GETKEYS', 'ZDIFFSTORE', '{foo}diff-target', 2, '{foo}diff-a', '{foo}diff-b') == [b'{foo}diff-target', b'{foo}diff-a', b'{foo}diff-b']
+        expect_error(a.cmd('ZDIFFSTORE', '{bar}diff-target', 1, '{foo}diff-a'), 'CROSSSLOT')
+        expect_error(a.cmd('ZDIFF', 2, '{foo}diff-a', '{bar}diff-b'), 'CROSSSLOT')
+        assert cluster.execute_command('ZUNION', 2, '{foo}diff-a', '{foo}diff-b') == [b'a', b'b']
+        assert cluster.execute_command('ZINTER', 2, '{foo}diff-a', '{foo}diff-b') == [b'b']
+        assert cluster.execute_command('ZINTERCARD', 2, '{foo}diff-a', '{foo}diff-b', 'LIMIT', 1) == 1
+        assert cluster.execute_command('ZUNIONSTORE', '{foo}union-target', 2, '{foo}diff-a', '{foo}diff-b') == 2
+        assert cluster.execute_command('ZINTERSTORE', '{foo}inter-target', 2, '{foo}diff-a', '{foo}diff-b') == 1
+        for command in ['ZUNION', 'ZINTER', 'ZINTERCARD']:
+            expect_error(a.cmd(command, 2, '{foo}diff-a', '{bar}diff-b'), 'CROSSSLOT')
+        for command in ['ZUNIONSTORE', 'ZINTERSTORE']:
+            expect_error(a.cmd(command, '{bar}store-target', 1, '{foo}diff-a'), 'CROSSSLOT')
+        assert cluster.hset('{foo}rename-src', 'f', 'original') == 1
+        assert cluster.execute_command('COPY', '{foo}rename-src', '{foo}rename-copy') == 1
+        assert cluster.execute_command('RENAME', '{foo}rename-src', '{foo}rename-dst')
+        assert cluster.execute_command('RENAMENX', '{foo}rename-dst', '{foo}rename-copy') == 0
+        assert cluster.hset('{foo}rename-dst', 'f', 'changed') == 0
+        assert cluster.hget('{foo}rename-copy', 'f') == b'original'
+        for command in ['RENAME', 'RENAMENX', 'COPY']:
+            expect_error(a.cmd(command, '{foo}rename-dst', '{bar}rename-dst'), 'CROSSSLOT')
         pipe = cluster.pipeline()
         for i in range(100):
             pipe.set(f"pipe-{i}", str(i))
@@ -166,9 +373,46 @@ def main():
         # All collection kinds participate in slot routing, durable migration,
         # replay deduplication and crash recovery alongside strings.
         assert cluster.hset("{bar}hash", mapping={b"f\x00": b"v\xff"}) == 1
+        assert cluster.execute_command("HPEXPIREAT","{bar}hash",4102444700123,"FIELDS",1,b"f\x00") == [1]
+        expect_error(a.cmd("HPEXPIRETIME","{foo}hash","FIELDS",1,"field"), "MOVED")
+        assert cluster.execute_command("HSETEX","{bar}hash","FXX","KEEPTTL","FIELDS",1,b"f\x00",b"v\xff") == 1
+        assert cluster.execute_command("HGETEX","{bar}hash","FIELDS",1,b"f\x00") == [b"v\xff"]
+        expect_error(a.cmd("HGETEX","{foo}hash","FIELDS",1,"field"), "MOVED")
+        assert cluster.set("{bar}unlink", "v")
+        expect_error(a.cmd("UNLINK", "{foo}unlink"), "MOVED")
+        expect_error(a.cmd("UNLINK", "{bar}unlink", "{foo}unlink"), "CROSSSLOT")
+        assert cluster.unlink("{bar}unlink", "{bar}unlink") == 1
+        assert cluster.exists("{bar}unlink") == 0
+        expect_error(a.cmd("DUMP", "{foo}dump"), "MOVED")
+        dumped_hash = cluster.dump("{bar}hash")
+        assert dumped_hash[-10:-8] == b"\x0c\x00"
+        expect_error(a.cmd("RESTORE", "{foo}restore", 0, dumped_hash), "MOVED")
+        assert cluster.restore("{bar}hash", 0, dumped_hash, replace=True) == b"OK"
+        assert a.cmd("EXISTS", *(["{bar}hash"] * 2048)) == 2048
+        expect_error(a.cmd("EXISTS", *(["{bar}hash"] * 2048 + ["{foo}hash"])), "CROSSSLOT")
         assert cluster.rpush("{bar}list", "a", "b", "c") == 3
         assert cluster.sadd("{bar}set", "a", "b") == 2
         assert cluster.zadd("{bar}zset", {"a": 2, "b": 1}) == 2
+        assert cluster.execute_command('GEOADD','{bar}geo',13.361389,38.115556,'Palermo') == 1
+        geo_hash = cluster.execute_command('GEOHASH','{bar}geo','Palermo')
+        assert geo_hash == [b'sqc8b49rny0'], geo_hash
+        expect_error(a.cmd('GEOPOS','{foo}geo','Palermo'), 'MOVED')
+        assert cluster.execute_command('GEOSEARCHSTORE','{bar}geo-copy','{bar}geo','FROMMEMBER','Palermo','BYRADIUS',10,'km') == 1
+        expect_error(a.cmd('GEORADIUSBYMEMBER','{bar}geo','Palermo',10,'km','STORE','{foo}geo-radius'), 'CROSSSLOT')
+        assert cluster.execute_command('GEORADIUSBYMEMBER','{bar}geo','Palermo',10,'km','STORE','{foo}ignored','STORE','{bar}geo-radius') == 1
+        expect_error(a.cmd('GEORADIUSBYMEMBER_RO','{foo}geo','Palermo',10,'km'), 'MOVED')
+        expect_error(a.cmd('GEOSEARCHSTORE','{foo}geo','{bar}geo','FROMMEMBER','Palermo','BYRADIUS',10,'km'), 'CROSSSLOT')
+        assert cluster.pfadd('{bar}hll','a','b','c') == 1
+        assert cluster.pfcount('{bar}hll') == 3
+        assert cluster.pfmerge('{bar}hll-union','{bar}hll')
+        assert cluster.pfcount('{bar}hll','{bar}hll-union') == 3
+        expect_error(a.cmd('PFCOUNT','{bar}hll','{foo}hll'), 'CROSSSLOT')
+        expect_error(a.cmd('PFMERGE','{bar}hll','{foo}hll'), 'CROSSSLOT')
+        expect_error(a.cmd('PFADD','{foo}hll','v'), 'MOVED')
+        expect_error(a.cmd('PFDEBUG','ENCODING','{foo}hll'), 'MOVED')
+        assert cluster.execute_command('PFDEBUG','TODENSE','{bar}hll') == 1
+        assert cluster.execute_command('PFDEBUG','ENCODING','{bar}hll') == b'dense'
+
         expect_error(a.cmd("SUNION", "{bar}set", "{foo}set"), "CROSSSLOT")
         assert a.cmd("SET", "{bar}ttl", "expiring", "PX", 60000) == b"OK"
         assert a.cmd("SET", "{bar}late-expiry", "old-expired-copy") == b"OK"
@@ -179,6 +423,13 @@ def main():
         expect_error(a.cmd("GET", "{bar}missing"), "ASK 5061 ")
         expect_error(c.cmd("GET", "{bar}missing"), "MOVED 5061 ")
         # ASKING is per-connection, exactly once, including pipelines and PING.
+        client_id=c.cmd('CLIENT','ID')
+        c.socket.sendall(frame('ASKING')+frame('RESET')+frame('GET','{bar}missing'))
+        assert c.read()==b'OK' and c.read()==b'RESET'
+        expect_error(c.read(),'MOVED 5061 ')
+        assert c.cmd('CLIENT','ID')==client_id
+        seconds,micros=map(int,c.cmd('TIME'))
+        assert seconds>0 and 0<=micros<1000000
         c.socket.sendall(frame("ASKING") + frame("GET", "{bar}missing") + frame("GET", "{bar}missing"))
         assert c.read() == b"OK" and c.read() is None
         expect_error(c.read(), "MOVED")
@@ -300,7 +551,7 @@ def main():
         cluster.close(); cluster = None
         for shard in shards:
             shard.crash_restart()
-        cluster = RedisCluster(host="127.0.0.1", port=source.port, socket_timeout=10)
+        cluster = RedisCluster(host="127.0.0.1", port=source.port, socket_timeout=10, protocol=options.protocol)
         assert cluster.get("bar") == b"after-move"
         replay_client = target.client()
         try:
@@ -311,9 +562,18 @@ def main():
         assert cluster.get("{bar}new") == b"created-at-target"
         assert cluster.get("{bar}a") == b"one"
         assert cluster.hgetall("{bar}hash") == {b"f\x00": b"v\xff"}
+        assert cluster.execute_command("HPEXPIRETIME","{bar}hash","FIELDS",1,b"f\x00") == [4102444700123]
         assert cluster.lrange("{bar}list", 0, -1) == [b"a", b"b", b"c"]
         assert cluster.smembers("{bar}set") == {b"a", b"b"}
-        assert cluster.zrange("{bar}zset", 0, -1, withscores=True) == [(b"b", 1.0), (b"a", 2.0)]
+        assert cluster.pfcount('{bar}hll','{bar}hll-union') == 3
+        assert cluster.type('{bar}hll') == b'string'
+        geo_hash = cluster.execute_command('GEOHASH','{bar}geo','Palermo')
+        assert geo_hash == [b'sqc8b49rny0'], geo_hash
+        assert cluster.type('{bar}geo') == b'zset'
+        assert cluster.execute_command('GEORADIUSBYMEMBER_RO','{bar}geo-radius','Palermo',10,'km') == [b'Palermo']
+        assert cluster.execute_command('GEOSEARCH','{bar}geo-copy','FROMMEMBER','Palermo','BYBOX',10,10,'km') == [b'Palermo']
+        assert cluster.execute_command('PFDEBUG','ENCODING','{bar}hll') == b'dense'
+        assert [tuple(pair) for pair in cluster.zrange("{bar}zset", 0, -1, withscores=True)] == [(b"b", 1.0), (b"a", 2.0)]
         assert cluster.get("foo") == b"binary\x00\xff"
         assert cluster.get_node_from_key("bar").port == target.port
         # Exercise the operator itself, including idempotent completion, moving
@@ -323,7 +583,10 @@ def main():
         assert move_slot(nodes, target.id, source.id, slot) == 0
         assert cluster.get("bar") == b"after-move"
         assert cluster.get("{bar}a") == b"one"
-        print(f"PASS: redis-py {redis.__version__}, three PostgreSQL shards, discovery, MOVED/ASK/ASKING, CROSSSLOT, pipeline, TTL migration, interrupted transfers, durable topology and crash recovery ({'journal' if options.journal else 'direct'})")
+        if options.native_redis:
+            native_checks=check_native_cluster_transactions(shards,work,options.native_redis.resolve(),options.protocol)
+            print(f"PASS: {native_checks} native Redis cluster RESP{options.protocol} transaction comparisons")
+        print(f"PASS: RESP{options.protocol}, redis-py {redis.__version__}, three PostgreSQL shards, discovery, MOVED/ASK/ASKING, CROSSSLOT, pipeline, TTL migration, interrupted transfers, durable topology and crash recovery ({'journal' if options.journal else 'direct'})")
     except Exception:
         for shard in shards:
             print(shard.log.read_text()[-4000:])

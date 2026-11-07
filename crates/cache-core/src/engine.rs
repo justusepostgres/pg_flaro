@@ -1,4 +1,23 @@
+mod bitfield;
+mod bitmap;
+mod bitop;
+pub(crate) mod blocking;
 mod collection_write;
+mod expiry;
+mod float;
+mod geo;
+mod hash_expiry;
+mod hyperloglog;
+mod keys;
+mod lazyfree;
+mod lcs;
+mod rdb;
+pub(crate) mod scan;
+pub(crate) mod sort;
+mod string_options;
+mod strings;
+mod transaction;
+pub(crate) mod watch;
 use crate::protocol::Reply;
 use std::{
     collections::{HashMap, HashSet},
@@ -36,12 +55,15 @@ impl Mutation {
     }
 }
 pub struct Engine {
+    undo: Option<transaction::Undo>,
+    watches: HashMap<Bytes, watch::Version>,
     entries: HashMap<Bytes, Entry>,
     used: usize,
     limit: usize,
     // Conservative earliest deadline: deletes/overwrites may leave an earlier
     // stale bound, but never one later than any entry's actual expiry.
     next_expiry: Option<i64>,
+    hash_expirations: im::OrdSet<(i64, Bytes)>,
 }
 fn cost(k: &[u8], e: &Entry) -> usize {
     k.len() + e.value.memory_bytes() + 128
@@ -64,15 +86,29 @@ impl Engine {
 
     pub fn new(limit: usize) -> Self {
         Self {
+            undo: None,
+            watches: HashMap::new(),
             entries: HashMap::new(),
             used: 0,
             limit,
             next_expiry: None,
+            hash_expirations: im::OrdSet::new(),
         }
     }
-    pub fn restore(&mut self, key: Vec<u8>, entry: Entry, now: i64) -> Result<(), &'static str> {
+    pub fn restore(
+        &mut self,
+        key: Vec<u8>,
+        mut entry: Entry,
+        now: i64,
+    ) -> Result<(), &'static str> {
         if entry.expires_at_ms.is_some_and(|t| t <= now) {
             return Ok(());
+        }
+        if let Some(cleaned) = entry.value.expire_hash_fields(now) {
+            let Some(value) = cleaned else {
+                return Ok(());
+            };
+            entry.value = value;
         }
         let old = self
             .entries
@@ -84,13 +120,15 @@ impl Engine {
         }
         self.used = used;
         self.track_expiry(entry.expires_at_ms);
+        self.sync_hash_expiry(&key, Some(&entry));
+        self.touch_watch(&key);
         self.entries.insert(key.into(), entry);
         Ok(())
     }
     pub(crate) fn get(&self, key: &[u8], now: i64) -> Option<&Entry> {
         self.entries
             .get(key)
-            .filter(|e| e.expires_at_ms.is_none_or(|t| t > now))
+            .filter(|e| e.expires_at_ms.is_none_or(|t| t > now) && e.value.has_live_fields(now))
     }
     pub fn validate_cluster_ownership(
         &self,
@@ -133,6 +171,59 @@ impl Engine {
             })
             .count()
     }
+    /// Exactly one deadline per expiring hash. Persistent tree snapshots keep
+    /// transaction setup constant-time and rollback restores the full schedule.
+    fn sync_hash_expiry(&mut self, key: &[u8], entry: Option<&Entry>) {
+        let old = self
+            .entries
+            .get(key)
+            .and_then(|e| e.value.hash_expiration());
+        let new = entry.and_then(|e| e.value.hash_expiration());
+        if old == new {
+            return;
+        }
+        let key = self
+            .entries
+            .get_key_value(key)
+            .map_or_else(|| Bytes::from(key), |(stored, _)| stored.clone());
+        if let Some(deadline) = old {
+            self.hash_expirations.remove(&(deadline, key.clone()));
+        }
+        if let Some(deadline) = new {
+            self.hash_expirations.insert((deadline, key));
+        }
+    }
+    /// Deadlines are durable already; removing expired fields, like whole-key
+    /// reaping, requires no new persistence admission. Recovery repeats cleanup.
+    pub(crate) fn expire_hash_fields(&mut self, now: i64) {
+        while let Some((deadline, key)) = self.hash_expirations.iter().next().cloned() {
+            if deadline > now {
+                break;
+            }
+            let old = self.entries.get(&key).expect("scheduled hash exists");
+            let entry = old
+                .value
+                .expire_hash_fields(now)
+                .expect("scheduled hash has expired fields")
+                .map(|value| Entry {
+                    value,
+                    expires_at_ms: old.expires_at_ms,
+                });
+            if old.expires_at_ms.is_some_and(|deadline| deadline <= now) {
+                self.touch_watch_deletion(&key);
+            } else {
+                self.touch_watch(&key);
+            }
+            self.sync_hash_expiry(&key, entry.as_ref());
+            self.used -= self.entries.get(&key).map_or(0, |old| cost(&key, old));
+            if let Some(entry) = entry {
+                self.used += cost(&key, &entry);
+                self.entries.insert(key, entry);
+            } else {
+                self.entries.remove(&key);
+            }
+        }
+    }
     fn track_expiry(&mut self, expiry: Option<i64>) {
         if let Some(expiry) = expiry {
             self.next_expiry = Some(self.next_expiry.map_or(expiry, |old| old.min(expiry)));
@@ -152,6 +243,17 @@ impl Engine {
         expires_at_ms: Option<i64>,
         submit: &mut impl FnMut(Mutations) -> bool,
     ) -> Reply {
+        self.put_string(key, value, expires_at_ms, submit, true)
+    }
+    // Encoding-only HLL changes persist but do not invalidate Redis WATCH.
+    fn put_string(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        expires_at_ms: Option<i64>,
+        submit: &mut impl FnMut(Mutations) -> bool,
+        logical_change: bool,
+    ) -> Reply {
         let existing = self.entries.get_key_value(key);
         let used =
             self.used - existing.map_or(0, |(_, e)| cost(key, e)) + key.len() + value.len() + 128;
@@ -170,6 +272,12 @@ impl Engine {
             return Reply::Error("MISCONF persistence backlog full or unavailable");
         }
         self.track_expiry(entry.expires_at_ms);
+        self.sync_hash_expiry(&key, Some(&entry));
+        if logical_change {
+            self.touch_watch(&key);
+        } else {
+            self.record_change(&key);
+        }
         self.entries.insert(key, entry);
         self.used = used;
         Reply::Simple("OK")
@@ -206,6 +314,12 @@ impl Engine {
             return Reply::Error("MISCONF persistence backlog full or unavailable");
         }
         for (key, entry) in changes {
+            self.sync_hash_expiry(&key, entry.as_ref());
+            if entry.is_some() {
+                self.touch_watch(&key);
+            } else {
+                self.touch_watch_deletion(&key);
+            }
             if let Some(entry) = entry {
                 self.track_expiry(entry.expires_at_ms);
                 self.entries.insert(key.into(), entry);
@@ -217,12 +331,20 @@ impl Engine {
         reply
     }
     pub fn reap(&mut self, now: i64) {
+        if self.undo.is_some() {
+            return;
+        }
+        self.expire_hash_fields(now);
+        self.prune_watches();
         if self.next_expiry.is_none_or(|expiry| expiry > now) {
             return;
         }
         let mut next = None;
         self.entries.retain(|k, e| {
             if e.expires_at_ms.is_some_and(|t| t <= now) {
+                if let Some(deadline) = e.value.hash_expiration() {
+                    self.hash_expirations.remove(&(deadline, k.clone()));
+                }
                 self.used -= cost(k, e);
                 false
             } else {
@@ -240,19 +362,76 @@ impl Engine {
         now: i64,
         mut submit: impl FnMut(Mutations) -> bool,
     ) -> Reply {
+        self.expire_hash_fields(now);
         if a.is_empty() {
             return ARITY;
         }
+        if let Some(reply) = rdb::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = hash_expiry::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if blocking::supported(a[0]) {
+            return blocking::execute(self, a, now, &mut submit);
+        }
+        if let Some(reply) = geo::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = hyperloglog::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = float::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if eq(a[0], b"SORT") || eq(a[0], b"SORT_RO") {
+            return sort::execute(self, a, now, &mut submit);
+        }
+        if eq(a[0], b"LCS") {
+            return lcs::execute(self, a, now);
+        }
+        if let Some(reply) = scan::execute(self, a, now) {
+            return reply;
+        }
+        if let Some(reply) = bitfield::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = bitop::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = bitmap::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = keys::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = expiry::execute(self, a, now, &mut submit) {
+            return reply;
+        }
+        if let Some(reply) = strings::execute(self, a, now, &mut submit) {
+            return reply;
+        }
         if a.len() == 3 && eq(a[0], b"SET") {
             return self.put(a[1], a[2], None, &mut submit);
+        }
+        if let Some(reply) = string_options::execute(self, a, now, &mut submit) {
+            return reply;
         }
         if let Some(reply) = crate::collections::execute(self, a, now, &mut submit) {
             return reply;
         }
         if a.len() >= 2
-            && [b"GET".as_slice(), b"INCR", b"INCRBY"]
-                .iter()
-                .any(|cmd| eq(a[0], cmd))
+            && [
+                b"GET".as_slice(),
+                b"INCR",
+                b"INCRBY",
+                b"DECR",
+                b"DECRBY",
+                b"APPEND",
+                b"STRLEN",
+            ]
+            .iter()
+            .any(|cmd| eq(a[0], cmd))
             && self.get(a[1], now).is_some_and(|e| e.value.kind() != 0)
         {
             return crate::collections::WRONGTYPE;
@@ -270,6 +449,26 @@ impl Engine {
             b"PING" if a.len() == 1 => Reply::Simple("PONG"),
             b"PING" | b"ECHO" if a.len() == 2 => Reply::Bulk(Some(a[1].to_vec())),
             b"GET" if a.len() == 2 => Reply::Bulk(self.get(a[1], now).map(|e| e.value.to_vec())),
+            b"STRLEN" if a.len() == 2 => {
+                Reply::Integer(self.get(a[1], now).map_or(0, |e| e.value.len()) as i64)
+            }
+            b"APPEND" if a.len() == 3 => {
+                let old = self.get(a[1], now);
+                let len = old.map_or(0, |e| e.value.len()).saturating_add(a[2].len());
+                if len > crate::protocol::MAX_FRAME - a[1].len().min(crate::protocol::MAX_FRAME) {
+                    return Reply::Error("ERR string exceeds maximum size");
+                }
+                let expiry = old.and_then(|e| e.expires_at_ms);
+                let mut value = Vec::with_capacity(len);
+                if let Some(old) = old {
+                    value.extend_from_slice(&old.value);
+                }
+                value.extend_from_slice(a[2]);
+                return match self.put(a[1], &value, expiry, &mut submit) {
+                    Reply::Simple("OK") => Reply::Integer(len as i64),
+                    error => error,
+                };
+            }
             b"MGET" if a.len() >= 2 => {
                 // Bound before cloning values: repeated keys can amplify a tiny
                 // request into an otherwise enormous allocation.
@@ -299,40 +498,6 @@ impl Engine {
             }
             b"EXISTS" if a.len() >= 2 => {
                 Reply::Integer(a[1..].iter().filter(|k| self.get(k, now).is_some()).count() as i64)
-            }
-            b"SET" if a.len() >= 3 => {
-                let (mut condition, mut expiry) = (None, None);
-                let mut i = 3;
-                while i < a.len() {
-                    if eq(a[i], b"NX") || eq(a[i], b"XX") {
-                        if condition.is_some() {
-                            return SYNTAX;
-                        }
-                        condition = Some(eq(a[i], b"NX"));
-                        i += 1;
-                    } else if eq(a[i], b"EX") || eq(a[i], b"PX") {
-                        if expiry.is_some() || i + 1 >= a.len() {
-                            return SYNTAX;
-                        }
-                        let factor = if eq(a[i], b"EX") { 1000 } else { 1 };
-                        let Some(t) = integer(a[i + 1])
-                            .filter(|n| *n > 0)
-                            .and_then(|n| n.checked_mul(factor))
-                            .and_then(|n| now.checked_add(n))
-                        else {
-                            return Reply::Error("ERR invalid expire time in 'set' command");
-                        };
-                        expiry = Some(t);
-                        i += 2;
-                    } else {
-                        return SYNTAX;
-                    }
-                }
-                let exists = self.get(a[1], now).is_some();
-                if condition.is_some_and(|nx| nx == exists) {
-                    return Reply::Bulk(None);
-                }
-                return self.put(a[1], a[2], expiry, &mut submit);
             }
             b"SETEX" | b"PSETEX" if a.len() == 4 => {
                 let Some(ttl) = integer(a[2]) else {
@@ -374,8 +539,15 @@ impl Engine {
                 }
                 Reply::Integer(count)
             }
-            b"INCR" | b"INCRBY" if a.len() == if cmd == b"INCR" { 2 } else { 3 } => {
-                let increment = if cmd == b"INCR" {
+            b"INCR" | b"INCRBY" | b"DECR" | b"DECRBY"
+                if a.len()
+                    == if cmd == b"INCR" || cmd == b"DECR" {
+                        2
+                    } else {
+                        3
+                    } =>
+            {
+                let increment = if cmd == b"INCR" || cmd == b"DECR" {
                     1
                 } else {
                     let Some(increment) = integer(a[2]) else {
@@ -383,11 +555,19 @@ impl Engine {
                     };
                     increment
                 };
+                if cmd == b"DECRBY" && increment == i64::MIN {
+                    return Reply::Error("ERR decrement would overflow");
+                }
                 let old = self.get(a[1], now);
                 let Some(n) = old.map_or(Some(0), |e| integer(&e.value)) else {
                     return Reply::Error("ERR value is not an integer or out of range");
                 };
-                let Some(n) = n.checked_add(increment) else {
+                let result = if cmd == b"DECR" || cmd == b"DECRBY" {
+                    n.checked_sub(increment)
+                } else {
+                    n.checked_add(increment)
+                };
+                let Some(n) = result else {
                     return Reply::Error("ERR increment or decrement would overflow");
                 };
                 changes.insert(
@@ -398,45 +578,6 @@ impl Engine {
                     }),
                 );
                 Reply::Integer(n)
-            }
-            b"TTL" | b"PTTL" if a.len() == 2 => Reply::Integer(match self.get(a[1], now) {
-                None => -2,
-                Some(Entry {
-                    expires_at_ms: None,
-                    ..
-                }) => -1,
-                Some(e) => {
-                    let ms = e.expires_at_ms.unwrap() - now;
-                    if cmd == b"TTL" {
-                        (ms + 500) / 1000
-                    } else {
-                        ms
-                    }
-                }
-            }),
-            b"EXPIRE" | b"PEXPIRE" if a.len() == 3 => {
-                let factor = if cmd == b"EXPIRE" { 1000 } else { 1 };
-                let Some(t) = integer(a[2])
-                    .and_then(|n| n.checked_mul(factor))
-                    .and_then(|n| now.checked_add(n))
-                else {
-                    return Reply::Error("ERR value is not an integer or out of range");
-                };
-                let Some(old) = self.get(a[1], now) else {
-                    return Reply::Integer(0);
-                };
-                changes.insert(
-                    a[1].to_vec(),
-                    if t <= now {
-                        None
-                    } else {
-                        Some(Entry {
-                            value: old.value.clone(),
-                            expires_at_ms: Some(t),
-                        })
-                    },
-                );
-                Reply::Integer(1)
             }
             b"PERSIST" if a.len() == 2 => {
                 let Some(old) = self.get(a[1], now).filter(|e| e.expires_at_ms.is_some()) else {
@@ -459,8 +600,10 @@ impl Engine {
                 }
             }
             b"PING" | b"ECHO" | b"GET" | b"MGET" | b"EXISTS" | b"SET" | b"MSET" | b"DEL"
-            | b"INCR" | b"INCRBY" | b"SETEX" | b"PSETEX" | b"TTL" | b"PTTL" | b"EXPIRE"
-            | b"PEXPIRE" | b"PERSIST" | b"SELECT" => ARITY,
+            | b"INCR" | b"INCRBY" | b"DECR" | b"DECRBY" | b"APPEND" | b"STRLEN" | b"SETEX"
+            | b"PSETEX" | b"TTL" | b"PTTL" | b"EXPIRE" | b"PEXPIRE" | b"PERSIST" | b"SELECT" => {
+                ARITY
+            }
             _ => Reply::Error("ERR unknown or unsupported command"),
         };
         if changes.is_empty() {
@@ -486,6 +629,12 @@ impl Engine {
             return Reply::Error("MISCONF persistence backlog full or unavailable");
         }
         for (k, v) in changes {
+            self.sync_hash_expiry(&k, v.as_ref());
+            if v.is_some() {
+                self.touch_watch(&k);
+            } else {
+                self.touch_watch_deletion(&k);
+            }
             if let Some(e) = v {
                 self.track_expiry(e.expires_at_ms);
                 self.entries.insert(k.into(), e);
@@ -507,6 +656,47 @@ mod tests {
             now,
             |_| true,
         )
+    }
+    #[test]
+    fn string_extensions_preserve_ttl_and_reject_without_mutating() {
+        let mut e = Engine::new(65536);
+        assert_eq!(run(&mut e, &["STRLEN", "k"], 0), Reply::Integer(0));
+        assert_eq!(run(&mut e, &["APPEND", "k", ""], 0), Reply::Integer(0));
+        assert_eq!(run(&mut e, &["EXISTS", "k"], 0), Reply::Integer(1));
+        run(&mut e, &["SET", "k", "-1", "PX", "100"], 0);
+        assert_eq!(
+            run(&mut e, &["DECRBY", "k", "-9223372036854775808"], 1),
+            Reply::Error("ERR decrement would overflow")
+        );
+        run(&mut e, &["SET", "k", "9223372036854775807", "PX", "99"], 1);
+        assert!(matches!(
+            run(&mut e, &["DECRBY", "k", "-1"], 1),
+            Reply::Error(_)
+        ));
+        assert_eq!(run(&mut e, &["PTTL", "k"], 1), Reply::Integer(99));
+        let old = e.snapshot(b"k");
+        let used = e.used;
+        for args in [vec![b"APPEND".as_slice(), b"k", b"x"], vec![b"DECR", b"k"]] {
+            assert!(matches!(e.execute(&args, 1, |_| false), Reply::Error(_)));
+            assert_eq!(e.snapshot(b"k"), old);
+            assert_eq!(e.used, used);
+        }
+        assert_eq!(run(&mut e, &["DECR", "k"], 100), Reply::Integer(-1));
+        assert_eq!(run(&mut e, &["PTTL", "k"], 100), Reply::Integer(-1));
+        assert_eq!(
+            e.execute(&[b"APPEND", b"k", b"\0\xff"], 100, |_| true),
+            Reply::Integer(4)
+        );
+        assert_eq!(run(&mut e, &["STRLEN", "k"], 100), Reply::Integer(4));
+        run(&mut e, &["HSET", "h", "f", "v"], 100);
+        for args in [
+            vec!["STRLEN", "h"],
+            vec!["APPEND", "h", "v"],
+            vec!["DECR", "h"],
+            vec!["DECRBY", "h", "1"],
+        ] {
+            assert_eq!(run(&mut e, &args, 100), crate::collections::WRONGTYPE);
+        }
     }
     #[test]
     fn expiry_deadline_survives_restore_rejection_and_expiry_changes() {

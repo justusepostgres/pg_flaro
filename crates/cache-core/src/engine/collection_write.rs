@@ -21,6 +21,11 @@ impl Engine {
         now: i64,
         sink: &mut Sink,
     ) -> Option<Reply> {
+        // The transaction path uses immutable replacement values so the undo
+        // record always retains the pre-transaction collection snapshot.
+        if self.undo.is_some() {
+            return None;
+        }
         let cmd = *a.first()?;
         let supported = a.len() == 4
             && (eq(cmd, b"HSET") || eq(cmd, b"LSET") || eq(cmd, b"ZINCRBY"))
@@ -35,7 +40,7 @@ impl Engine {
         }
         let data = entry.value.collection()?;
         let (edit, reply, payload_delta, count_delta, fields) = match data {
-            Collection::Hash(h) if eq(cmd, b"HSET") => {
+            Collection::Hash(h) if eq(cmd, b"HSET") && !h.has_expirations() => {
                 let old = h.get_key_value(a[2]);
                 let delta = if let Some((_, v)) = old {
                     a[3].len() as isize - v.len() as isize
@@ -100,11 +105,15 @@ impl Engine {
                 if score.is_nan() {
                     return Some(Reply::Error("ERR resulting score is not a number (NaN)"));
                 }
+                let unchanged = old.is_some_and(|(_, old)| old.0 == score);
                 let reply = Reply::Bulk(Some(if score == 0.0 {
                     b"0".to_vec()
                 } else {
                     score.to_string().into_bytes()
                 }));
+                if unchanged {
+                    return Some(reply);
+                }
                 (
                     Edit::Score(old.map_or_else(|| a[3].into(), |(k, _)| k.clone()), score),
                     reply,
@@ -176,6 +185,7 @@ impl Engine {
         *size = encoded_len;
         *accounted = memory;
         self.used = used;
+        self.touch_watch(key);
         Some(reply)
     }
 }

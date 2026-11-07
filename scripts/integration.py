@@ -41,7 +41,16 @@ class Client:
         if kind == b"+": return value
         if kind == b"-": return RedisError(value.decode())
         if kind == b":": return int(value)
-        if kind == b"*": return [self.read() for _ in range(int(value))]
+        if kind == b"_": return None
+        if kind == b",": return float(value)
+        if kind == b"%": return {self.read(): self.read() for _ in range(int(value))}
+        if kind == b"~":
+            members = [self.read() for _ in range(int(value))]
+            try: return set(members)
+            except TypeError: return members  # RESP3 sets may contain maps or arrays.
+        if kind == b"*":
+            n = int(value)
+            return None if n == -1 else [self.read() for _ in range(n)]
         if kind == b"$":
             n = int(value)
             if n == -1: return None
@@ -152,7 +161,7 @@ def main():
     base = ROOT / ".local"
     base.mkdir(exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="integration-", dir=base))
-    sources = sorted((ROOT / "crates").rglob("*.rs")) + sorted((ROOT / "crates").rglob("*.sql")) + sorted((ROOT / "crates").rglob("Cargo.toml")) + sorted((ROOT / "scripts").glob("*.py")) + [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
+    sources = sorted((ROOT / "crates").rglob("*.json")) + sorted((ROOT / "crates").rglob("*.c")) + sorted((ROOT / "crates").rglob("*.rs")) + sorted((ROOT / "crates").rglob("*.sql")) + sorted((ROOT / "crates").rglob("Cargo.toml")) + sorted((ROOT / "scripts").glob("*.py")) + [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
     disable_nestloop = os.environ.get("PG_CACHE_DISABLE_NESTLOOP", "0")
     assert disable_nestloop in ("0", "1")
     value_storage = os.environ.get("PG_CACHE_VALUE_STORAGE", "EXTENDED").upper()

@@ -1,6 +1,6 @@
 # Redis Cluster client mode
 
-Flaro supports Redis Cluster client routing over RESP2, with one independent
+Flaro supports Redis Cluster client routing over RESP2 and RESP3, with one independent
 PostgreSQL cluster per shard. Each shard holds its own in-memory dataset and
 WAL-logged persistence. CNPG can replicate and promote PostgreSQL instances within
 that shard. Advertise a stable primary Service endpoint for each shard.
@@ -48,17 +48,40 @@ this code; previous benchmark images and packages do not contain cluster support
 
 ## Client and command compatibility
 
-Use RESP2 and database 0. The string commands and [collection command subset](data-types.md) are available.
+Use RESP2 or RESP3 and database 0. The string commands and [collection command subset](data-types.md) are available.
 Redis Cluster CRC16/XMODEM, nonempty `{hash tags}`, binary keys, `MOVED`, `ASK`,
-one-command/per-connection `ASKING`, and `CROSSSLOT` checks are implemented.
+per-connection `ASKING` for the next command or transaction, and `CROSSSLOT` checks are implemented.
 Multi-key operations must use one slot, including `MGET`, `MSET`, `DEL`, `EXISTS`, and multi-key set algebra (including
 store destinations). During migration, a request with both present and missing source keys
-receives `TRYAGAIN`. Pipelining is supported; transactions and Lua remain unsupported.
+receives `TRYAGAIN`. Pipelining and same-slot `MULTI`/`EXEC` transactions are
+supported, including `WATCH`/`UNWATCH`. Lua remains unsupported. Commands targeting
+different slots on the same node may queue; `EXEC` rejects the combined key set
+with `CROSSSLOT`. Commands targeting another owner receive `MOVED` during queuing
+and invalidate the transaction. `EXEC` rechecks all queued keys together against
+current ownership and migration state. On an importing node, `ASKING` allows a
+single distinct missing key, but multiple distinct keys with missing data return
+`TRYAGAIN`. These checks occur before queued-command and WATCH abort checks.
 
 Discovery and administration:
 
 - `COMMAND`, `COMMAND COUNT`, `COMMAND INFO`, `COMMAND GETKEYS` describe the supported
-  data commands for client-side key extraction.
+  data commands for client-side key extraction. `COMMAND INFO` without names
+  returns the full top-level catalog. `COMMAND LIST` also lists supported
+  subcommands and accepts `FILTERBY PATTERN`, `ACLCAT`, or `MODULE`. Pattern
+  matching is case-insensitive; no Redis modules are loaded. ACL categories
+  describe reference command semantics and do not enable ACL enforcement.
+  `COMMAND GETKEYSANDFLAGS` returns each key with its access mode and effects,
+  including distinct source/destination roles for duplicate key names and dynamic
+  SET/BITFIELD flags. RESP3 encodes the flags as sets.
+  INFO includes all ten modern fields: command identity, arity, flags, legacy
+  key positions, categories, tips, key specifications, and supported nested
+  subcommands. The catalog describes the pinned Redis reference; flags such as
+  `fast` do not establish Flaro complexity/performance parity. `COMMAND DOCS`
+  returns reference summaries, histories, deprecation details, and nested argument
+  schemas for the supported catalog; named lookups omit unknown commands.
+  `COMMAND HELP` describes the discovery subcommands. Documentation is generated
+  from Redis 8.2.11 and does not prove all options or complexity guarantees are
+  implemented; broader option/version audits remain pending.
 - `CLUSTER SLOTS`, `SHARDS`, `NODES`, `MYID`, `INFO`, `KEYSLOT`.
 - `CLUSTER COUNTKEYSINSLOT slot`, `GETKEYSINSLOT slot count` (maximum count 1024;
   reduce it if the bounded reply would exceed 1 MiB).
@@ -181,3 +204,19 @@ Protocol references: [Redis Cluster specification](https://redis.io/docs/latest/
 [SETSLOT](https://redis.io/docs/latest/commands/cluster-setslot/),
 [MIGRATE](https://redis.io/docs/latest/commands/migrate/).
 The deployment example follows [CNPG synchronous replication](https://cloudnative-pg.io/docs/1.27/replication/).
+
+
+Native Redis transaction comparison:
+
+```sh
+PGRX_PG_CONFIG_PATH=/path/to/pg_config python scripts/cluster_integration.py --protocol 3 --journal --native-redis /path/to/redis-8.2.11/src/redis-server
+```
+
+This optionally starts three additional disposable native Redis nodes. It compares
+42 protocol replies covering cross-slot timing, queue-time redirection, EXEC error
+precedence, queued ASKING, slots starting migration after queuing, aggregate
+present/missing-key checks, and ASKING lasting through a transaction. Error
+addresses are normalized by node; reply/error types, slots and message text remain
+part of the comparison. RESP2/direct and RESP3/journal reference comparisons have
+passed. This does not establish Redis bus, replica, election, native migration
+payload, administrative-transaction or all failure-schedule compatibility.

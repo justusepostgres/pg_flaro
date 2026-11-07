@@ -1,6 +1,12 @@
 //! Redis Cluster client routing. PostgreSQL owns replication; no Redis cluster bus.
+mod command_categories;
+mod command_docs;
+mod command_help;
+mod command_info;
 mod commands;
-pub(crate) use commands::command;
+mod key_flags;
+mod static_key_flags;
+pub(crate) use commands::{command, command_keys, validate_command};
 mod migration;
 mod topology;
 use crate::{engine::Engine, protocol::Reply};
@@ -80,21 +86,42 @@ impl Cluster {
         engine: &Engine,
         now: i64,
     ) -> Option<Reply> {
+        if args
+            .first()
+            .is_some_and(|c| c.eq_ignore_ascii_case(b"SORT") || c.eq_ignore_ascii_case(b"SORT_RO"))
+        {
+            if let Some(error) = crate::engine::sort::cluster_patterns(args) {
+                return Some(error);
+            }
+        }
         let keys = commands::keys(args)?;
+        self.route_keys(keys, asking, engine, now)
+    }
+    pub(crate) fn route_keys<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a [u8]>,
+        asking: bool,
+        engine: &Engine,
+        now: i64,
+    ) -> Option<Reply> {
         let mut keys = keys.into_iter();
         let first = keys.next()?;
         let slot = keyslot(first);
         let moving = self.topology.migrating.contains_key(&slot);
-        let mut present = usize::from(moving && engine.get(first, now).is_some());
+        let importing = self.topology.importing.contains_key(&slot);
+        let inspect_presence = moving || importing;
+        let mut present = usize::from(inspect_presence && engine.get(first, now).is_some());
         let mut count = 1;
+        let mut distinct = false;
         for key in keys {
             if keyslot(key) != slot {
                 return Some(Reply::Error(
                     "CROSSSLOT Keys in request don't hash to the same slot",
                 ));
             }
+            distinct |= key != first;
             count += 1;
-            present += usize::from(moving && engine.get(key, now).is_some());
+            present += usize::from(inspect_presence && engine.get(key, now).is_some());
         }
         let t = &self.topology;
         if t.pending.as_ref().is_some_and(|p| p.slot == slot) {
@@ -105,6 +132,11 @@ impl Cluster {
         let owner = t.owners[slot as usize];
         if owner != t.local {
             if asking && t.importing.get(&slot) == Some(&owner) {
+                if distinct && present != count {
+                    return Some(Reply::Error(
+                        "TRYAGAIN Multiple keys request during rehashing of slot",
+                    ));
+                }
                 return None;
             }
             return Some(t.redirect("MOVED", slot, owner));
@@ -202,6 +234,25 @@ mod routing_tests {
         c = t.config.clone();
         c.nodes[0].port += 1;
         assert!(Topology::restore(c, &t.json()).is_err());
+    }
+    #[test]
+    fn importing_checks_all_distinct_keys_but_allows_repeated_missing_key() {
+        let (tx, _) = mpsc::sync_channel(1);
+        let mut c = Cluster::new(topology(), tx);
+        let mut e = Engine::new(4096);
+        c.topology.importing.insert(12182, 1);
+        e.execute(&[b"SET", b"{foo}present", b"v"], 0, |_| true);
+        let mixed: &[&[u8]] = &[b"{foo}present", b"{foo}missing"];
+        assert!(
+            matches!(c.route_keys(mixed.iter().copied(), true, &e, 0), Some(Reply::Error(s)) if s.starts_with("TRYAGAIN"))
+        );
+        let repeated: &[&[u8]] = &[b"{foo}missing", b"{foo}missing"];
+        assert!(c
+            .route_keys(repeated.iter().copied(), true, &e, 0)
+            .is_none());
+        assert!(
+            matches!(c.route_keys(repeated.iter().copied(), false, &e, 0), Some(Reply::OwnedError(s)) if s.starts_with("MOVED"))
+        );
     }
     #[test]
     fn migration_routes_multikey_and_fences_uncertain_transfers() {

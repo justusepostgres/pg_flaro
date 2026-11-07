@@ -8,6 +8,7 @@ pub mod journal;
 pub mod metrics;
 mod persistence;
 pub mod protocol;
+mod random;
 pub mod server;
 pub mod value;
 
